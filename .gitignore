@@ -1,0 +1,10 @@
+.build/
+TestResults/
+Release/
+*.dSYM/
+.DS_Store
+*.log
+private/
+Backups/
+__pycache__/
+*.pyc

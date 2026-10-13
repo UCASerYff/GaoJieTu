@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "bundleID": "com.gaoseries.GaoJieTu",
+  "appVersion": "1.00",
+  "actions": [
+    {
+      "action": "capture.region",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {
+          "delaySeconds": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 60
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "action": "capture.window",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {
+          "delaySeconds": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 60
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "action": "capture.display",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {
+          "delaySeconds": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 60
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "action": "ocr.files",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {
+          "languages": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "text",
+                "markdown",
+                "json",
+                "searchablePDF"
+              ]
+            }
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "action": "images.annotate",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "action": "images.pin",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "action": "text.translate",
+      "parametersSchema": {
+        "type": "object",
+        "properties": {
+          "sourceLanguage": {
+            "type": "string"
+          },
+          "targetLanguage": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "targetLanguage"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
