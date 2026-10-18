@@ -93,4 +93,52 @@ func runCaptureRegressionTests() throws {
     try captureRegressionCheck(PinnedImageGeometry.actualPixelScale(backingScale: 2) == 0.5, "A 2x screen uses half a point per image pixel")
     try captureRegressionCheck(400 * PinnedImageGeometry.actualPixelScale(backingScale: 2) * 2 == 400, "1:1 on Retina must keep physical pixel count unchanged")
     print("PASS Capture regressions: front-to-back hit, selected scroll anchor, corresponding seam previews and adjustment, fractional 1x/2x region snapping, current-screen pin scale (no GUI/capture).")
+    try runCaptureWindowEventRegressionTests()
+}
+
+/// Regression for the actual full-screen Dock overlay mis-hit. Framework event conversion is injected;
+/// this does not create a panel, synthesize/post an event, enumerate live windows or capture the screen.
+@MainActor
+func runCaptureWindowEventRegressionTests() throws {
+    let regularApplications = ["com.apple.finder", "com.apple.Safari", "com.apple.TextEdit", "com.apple.Terminal"]
+    for bundleID in regularApplications {
+        try captureRegressionCheck(CaptureWindowEligibility.allows(layer: 0, alpha: 1, processID: 42, bundleID: bundleID, ownerName: "Synthetic sample"), "Ordinary sample application windows must remain selectable")
+    }
+    try captureRegressionCheck(!CaptureWindowEligibility.allows(layer: 20, alpha: 1, processID: 42, bundleID: "com.example.sample", ownerName: "Synthetic floating layer"), "Floating layers must not participate in ordinary-window hit-testing")
+    try captureRegressionCheck(!CaptureWindowEligibility.allows(layer: 0, alpha: 0, processID: 42, bundleID: "com.example.sample", ownerName: "Synthetic transparent window"), "A fully transparent window must not cover a visible sample")
+    try captureRegressionCheck(!CaptureWindowEligibility.allows(layer: nil, alpha: 1, processID: 42, bundleID: "com.example.sample", ownerName: "Missing metadata"), "Missing layer metadata cannot be treated as an ordinary window")
+    try captureRegressionCheck(!CaptureWindowEligibility.allows(layer: 0, alpha: .nan, processID: 42, bundleID: "com.example.sample", ownerName: "Invalid alpha"), "Non-finite transparency metadata must fail closed")
+    try captureRegressionCheck(!CaptureWindowEligibility.allows(layer: 0, alpha: 1, processID: 42, bundleID: "com.apple.dock", ownerName: "程序坞"), "Even a layer-zero full-screen Dock rectangle is a system overlay")
+    try captureRegressionCheck(!CaptureWindowEligibility.allows(layer: 0, alpha: 1, processID: 42, bundleID: nil, ownerName: "程序坞"), "Localized Dock owner fallback must reject a missing bundle identifier")
+
+    let fullScreen = CGRect(x: 0, y: 0, width: 3420, height: 2224)
+    let dock = CaptureWindow(id: 90, title: "Dock", applicationName: "程序坞", processID: 42, frame: fullScreen, isOnScreen: true,
+                             zOrder: 0, windowLayer: 0, alpha: 1, bundleID: "com.apple.dock")
+    let transparent = CaptureWindow(id: 92, title: "Transparent fixture", applicationName: "Fixture", processID: 43, frame: fullScreen, isOnScreen: true,
+                                    zOrder: 1, windowLayer: 0, alpha: 0, bundleID: "com.example.fixture")
+    let finder = CaptureWindow(id: 91, title: "Acceptance", applicationName: "Finder", processID: 44, frame: CGRect(x: 400, y: 200, width: 1800, height: 1400), isOnScreen: true,
+                               zOrder: 2, windowLayer: 0, alpha: 1, bundleID: "com.apple.finder")
+    try captureRegressionCheck(CaptureWindowHitTesting.frontmost(at: CGPoint(x: 1400, y: 800), windows: [dock, transparent, finder])?.id == finder.id, "A full-screen system Dock/transparent rectangle must not replace the known Finder sample")
+
+    let local = CGPoint(x: 120, y: 80)
+    var receivedLocal: CGPoint?
+    let screen = CaptureSelectionGeometry.screenPoint(eventLocationInWindow: local, convertToScreen: { point in
+        receivedLocal = point
+        return CGPoint(x: point.x - 500, y: point.y + 300)
+    })
+    try captureRegressionCheck(receivedLocal == local && screen == CGPoint(x: -380, y: 380), "The event-local point must go through the actual window-to-screen conversion boundary")
+    let eventDesktopPoint = CaptureSelectionGeometry.desktopPoint(appKitScreenPoint: screen, mainDisplayTop: 1000)
+    try captureRegressionCheck(eventDesktopPoint == CGPoint(x: -380, y: 620), "Negative display origins and the AppKit/desktop vertical conversion must remain correct")
+    let eventTarget = CaptureWindow(id: 93, title: "Directed click sample", applicationName: "Fixture", processID: 45,
+                                    frame: CGRect(x: -450, y: 550, width: 300, height: 300), isOnScreen: true, zOrder: 1)
+    let staleCursorTarget = CaptureWindow(id: 94, title: "Unrelated cursor fixture", applicationName: "Fixture", processID: 46,
+                                          frame: CGRect(x: 50, y: 900, width: 300, height: 300), isOnScreen: true, zOrder: 0)
+    let staleDesktopPoint = CaptureSelectionGeometry.desktopPoint(appKitScreenPoint: CGPoint(x: 100, y: 0), mainDisplayTop: 1000)
+    try captureRegressionCheck(CaptureWindowHitTesting.frontmost(at: staleDesktopPoint, windows: [staleCursorTarget, eventTarget])?.id == 94, "The stale global cursor fixture must represent a different eligible window")
+    try captureRegressionCheck(CaptureWindowHitTesting.frontmost(at: eventDesktopPoint, windows: [staleCursorTarget, eventTarget])?.id == 93, "A directed click must choose its event location rather than the unrelated global cursor location")
+    let end = CaptureSelectionGeometry.screenPoint(eventLocationInWindow: CGPoint(x: 150, y: 110), convertToScreen: { CGPoint(x: $0.x - 500, y: $0.y + 300) })
+    let selection = CaptureSelectionGeometry.selectionRect(from: screen, to: end)
+    try captureRegressionCheck(selection == CGRect(x: -380, y: 380, width: 30, height: 30), "Dragging must use its two converted event positions")
+    try captureRegressionCheck(CaptureGeometry.appKitToDesktop(selection, mainDisplayTop: 1000) == CGRect(x: -380, y: 590, width: 30, height: 30), "The final event-derived selection must keep its real desktop coordinates")
+    print("PASS Window-event regressions: layer/alpha/system-owner filtering, full-screen Dock exclusion, event-local conversion and directed-click/drag coordinates (no GUI/capture).")
 }

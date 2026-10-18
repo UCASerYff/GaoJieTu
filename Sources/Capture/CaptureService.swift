@@ -38,6 +38,9 @@ struct CaptureWindow: Identifiable {
     let isOnScreen: Bool
     /// WindowServer front-to-back rank. Unknown order is not safe for hover hit-testing.
     var zOrder: Int? = nil
+    var windowLayer: Int = 0
+    var alpha: Double = 1
+    var bundleID: String? = nil
 }
 
 struct CaptureCatalog {
@@ -77,6 +80,24 @@ struct CaptureRegionPlan {
     let pixelRect: CGRect
 }
 
+enum CaptureWindowEligibility {
+    private static let desktopOwners: Set<String> = [
+        "com.apple.dock", "com.apple.windowserver", "com.apple.loginwindow", "com.apple.windowmanager",
+        "com.apple.systemuiserver", "com.apple.controlcenter", "com.apple.notificationcenterui", "com.apple.wallpaper.agent"
+    ]
+    private static let desktopOwnerNames: Set<String> = [
+        "dock", "程序坞", "windowserver", "window server", "loginwindow", "windowmanager", "systemuiserver", "control center", "notificationcenter"
+    ]
+
+    static func allows(layer: Int?, alpha: Double?, processID: pid_t?, bundleID: String?, ownerName: String) -> Bool {
+        guard layer == 0, let alpha, alpha.isFinite, alpha > 0, alpha <= 1, let processID, processID > 0 else { return false }
+        if let bundleID, !bundleID.isEmpty {
+            return !desktopOwners.contains(bundleID.lowercased())
+        }
+        return !desktopOwnerNames.contains(ownerName.lowercased())
+    }
+}
+
 enum CaptureWindowHitTesting {
     static func ranks(frontToBackIDs: [CGWindowID]) -> [CGWindowID: Int] {
         var result: [CGWindowID: Int] = [:]
@@ -85,7 +106,11 @@ enum CaptureWindowHitTesting {
     }
 
     static func frontmost(at point: CGPoint, windows: [CaptureWindow]) -> CaptureWindow? {
-        windows.enumerated().filter { $0.element.isOnScreen && $0.element.zOrder != nil && $0.element.frame.contains(point) }
+        windows.enumerated().filter {
+            let window = $0.element
+            return window.isOnScreen && window.zOrder != nil && window.frame.contains(point)
+                && CaptureWindowEligibility.allows(layer: window.windowLayer, alpha: window.alpha, processID: window.processID, bundleID: window.bundleID, ownerName: window.applicationName)
+        }
             .min { left, right in
                 let leftRank = left.element.zOrder!, rightRank = right.element.zOrder!
                 return leftRank == rightRank ? left.offset < right.offset : leftRank < rightRank
@@ -164,15 +189,27 @@ final class CaptureService {
         content = fresh
         let orderedWindows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let ranks = CaptureWindowHitTesting.ranks(frontToBackIDs: orderedWindows.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
+        let properties = orderedWindows.reduce(into: [CGWindowID: [String: Any]]()) { result, window in
+            if let id = (window[kCGWindowNumber as String] as? NSNumber)?.uint32Value, result[id] == nil { result[id] = window }
+        }
         let displays = fresh.displays.map { display -> CaptureDisplay in
             let screen = NSScreen.screens.first { CaptureGeometry.displayID($0) == display.displayID }
             let scale = screen?.backingScaleFactor ?? CGFloat(display.width) / max(1, display.frame.width)
             return CaptureDisplay(id: display.displayID, name: screen?.localizedName ?? "显示器 \(display.displayID)",
                                   frame: display.frame, scale: scale, rotation: Int(CGDisplayRotation(display.displayID)))
         }
-        let windows = fresh.windows.filter { $0.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier && $0.frame.width > 1 && $0.frame.height > 1 }.map {
-            CaptureWindow(id: $0.windowID, title: $0.title ?? "无标题窗口", applicationName: $0.owningApplication?.applicationName ?? "未知应用",
-                          processID: $0.owningApplication?.processID ?? 0, frame: $0.frame, isOnScreen: $0.isOnScreen, zOrder: ranks[$0.windowID])
+        let windows = fresh.windows.compactMap { window -> CaptureWindow? in
+            guard let application = window.owningApplication, application.processID != ProcessInfo.processInfo.processIdentifier,
+                  window.isOnScreen, window.windowLayer == 0, window.frame.width > 1, window.frame.height > 1,
+                  let metadata = properties[window.windowID],
+                  let layer = (metadata[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                  let alpha = (metadata[kCGWindowAlpha as String] as? NSNumber)?.doubleValue,
+                  let ownerPID = (metadata[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  ownerPID == application.processID,
+                  CaptureWindowEligibility.allows(layer: layer, alpha: alpha, processID: ownerPID, bundleID: application.bundleIdentifier, ownerName: application.applicationName) else { return nil }
+            return CaptureWindow(id: window.windowID, title: window.title ?? "无标题窗口", applicationName: application.applicationName,
+                                 processID: application.processID, frame: window.frame, isOnScreen: true, zOrder: ranks[window.windowID],
+                                 windowLayer: layer, alpha: alpha, bundleID: application.bundleIdentifier)
         }
         return CaptureCatalog(displays: displays, windows: windows)
     }
@@ -216,8 +253,9 @@ final class CaptureService {
             }
             bounds = local.offsetBy(dx: display.frame.minX, dy: display.frame.minY)
         case .window(let id):
-            guard let window = content.windows.first(where: { $0.windowID == id }),
-                  window.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier,
+            guard let allowed = catalog.windows.first(where: { $0.id == id }),
+                  let window = content.windows.first(where: { $0.windowID == id }),
+                  window.owningApplication?.processID == allowed.processID,
                   window.frame.width > 0, window.frame.height > 0 else { throw CaptureFailure.sourceMissing }
             filter = SCContentFilter(desktopIndependentWindow: window)
             scale = CGFloat(filter.pointPixelScale)
@@ -248,7 +286,8 @@ final class CaptureService {
         }
         let catalog = try await refreshCatalog()
         guard let content else { throw CaptureFailure.sourceMissing }
-        let selected = content.windows.filter { ids.contains($0.windowID) && $0.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier }
+        let allowedIDs = Set(catalog.windows.map(\.id))
+        let selected = content.windows.filter { ids.contains($0.windowID) && allowedIDs.contains($0.windowID) }
         guard selected.count == ids.count else { throw CaptureFailure.sourceMissing }
         let union = selected.reduce(CGRect.null) { $0.union($1.frame) }
         let start = Date()

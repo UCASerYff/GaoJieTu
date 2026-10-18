@@ -7,6 +7,20 @@ struct CaptureRegionSelection {
     let displayIDs: [CGDirectDisplayID]
 }
 
+enum CaptureSelectionGeometry {
+    static func screenPoint(eventLocationInWindow: CGPoint, convertToScreen: (CGPoint) -> CGPoint) -> CGPoint {
+        convertToScreen(eventLocationInWindow)
+    }
+
+    static func desktopPoint(appKitScreenPoint: CGPoint, mainDisplayTop: CGFloat) -> CGPoint {
+        CGPoint(x: appKitScreenPoint.x, y: mainDisplayTop - appKitScreenPoint.y)
+    }
+
+    static func selectionRect(from start: CGPoint, to end: CGPoint) -> CGRect {
+        CGRect(x: min(start.x, end.x), y: min(start.y, end.y), width: abs(end.x - start.x), height: abs(end.y - start.y))
+    }
+}
+
 @MainActor
 final class CaptureSelectionController {
     private var panels: [SelectionPanel] = []
@@ -17,6 +31,7 @@ final class CaptureSelectionController {
     private var localMonitor: Any?
     private var highlightedWindows: [CaptureWindow] = []
     private var windowPicked: ((CGWindowID?) -> Void)?
+    private var latestScreenPoint: CGPoint?
 
     /// User-visible selection only. No screenshot is taken while panels exist; completion closes every panel first.
     func selectRegion() async -> CaptureRegionSelection? {
@@ -30,6 +45,7 @@ final class CaptureSelectionController {
     /// Mouse hover highlights catalog windows; Escape cancels. Catalog is supplied by CaptureService.
     func selectWindow(from windows: [CaptureWindow]) async -> CGWindowID? {
         cancel()
+        guard !windows.isEmpty else { return nil }
         return await withCheckedContinuation { completion in
             windowPicked = { completion.resume(returning: $0) }
             present(windows: windows)
@@ -42,6 +58,7 @@ final class CaptureSelectionController {
         highlightedWindows = windows
         mainTop = NSScreen.screens.first?.frame.maxY ?? 0
         selection = .zero
+        latestScreenPoint = nil
         for screen in NSScreen.screens {
             let panel = SelectionPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             panel.level = .screenSaver
@@ -61,45 +78,52 @@ final class CaptureSelectionController {
         panels.first?.makeKey()
     }
 
-    fileprivate func down() {
+    fileprivate func down(at point: CGPoint) {
+        latestScreenPoint = point
         if !highlightedWindows.isEmpty {
-            if let id = windowAtMouse()?.id { finish(window: id) }
+            if let id = windowAtPointer()?.id { finish(window: id) }
             return
         }
-        dragOrigin = NSEvent.mouseLocation
-        selection = CGRect(origin: dragOrigin!, size: .zero)
+        dragOrigin = point
+        selection = CGRect(origin: point, size: .zero)
         redraw()
     }
 
-    fileprivate func drag() {
+    fileprivate func drag(at point: CGPoint) {
+        latestScreenPoint = point
         guard let origin = dragOrigin else { return }
-        let current = NSEvent.mouseLocation
-        selection = CGRect(x: min(origin.x, current.x), y: min(origin.y, current.y), width: abs(current.x - origin.x), height: abs(current.y - origin.y))
+        selection = CaptureSelectionGeometry.selectionRect(from: origin, to: point)
         redraw()
     }
 
-    fileprivate func up() {
+    fileprivate func up(at point: CGPoint) {
+        if dragOrigin != nil { drag(at: point) } else { latestScreenPoint = point }
         dragOrigin = nil
         // Keep the selection for arrow-key adjustment. Return/double click explicitly confirms.
         redraw()
     }
 
-    fileprivate func move() { if !highlightedWindows.isEmpty { redraw() } }
-    fileprivate func confirm() { if selection.width >= 1, selection.height >= 1 { finish(cancelled: false) } }
+    fileprivate func move(at point: CGPoint) { latestScreenPoint = point; if !highlightedWindows.isEmpty { redraw() } }
+    fileprivate func confirm(at point: CGPoint? = nil) {
+        if let point { latestScreenPoint = point }
+        if windowPicked != nil {
+            if let id = windowAtPointer()?.id { finish(window: id) }
+        } else if selection.width >= 1, selection.height >= 1 { finish(cancelled: false) }
+    }
 
-    private func windowAtMouse() -> CaptureWindow? {
-        let mouse = NSEvent.mouseLocation
-        let desktopPoint = CGPoint(x: mouse.x, y: mainTop - mouse.y)
+    private func windowAtPointer() -> CaptureWindow? {
+        guard let latestScreenPoint else { return nil }
+        let desktopPoint = CaptureSelectionGeometry.desktopPoint(appKitScreenPoint: latestScreenPoint, mainDisplayTop: mainTop)
         return CaptureWindowHitTesting.frontmost(at: desktopPoint, windows: highlightedWindows)
     }
 
     fileprivate var appKitSelection: CGRect {
-        if let window = windowAtMouse(), !highlightedWindows.isEmpty { return CaptureGeometry.desktopToAppKit(window.frame, mainDisplayTop: mainTop) }
+        if let window = windowAtPointer(), !highlightedWindows.isEmpty { return CaptureGeometry.desktopToAppKit(window.frame, mainDisplayTop: mainTop) }
         return selection
     }
 
     fileprivate var selectionLabel: String {
-        if let window = windowAtMouse(), !highlightedWindows.isEmpty { return "\(window.applicationName) · \(window.title)\n单击选择 · Esc 取消" }
+        if let window = windowAtPointer(), !highlightedWindows.isEmpty { return "\(window.applicationName) · \(window.title)\n单击或 Return 选择 · Esc 取消" }
         if !highlightedWindows.isEmpty { return "此处没有可确认前后顺序的窗口\n移动到目标窗口 · Esc 取消" }
         let desktop = CaptureGeometry.appKitToDesktop(selection, mainDisplayTop: mainTop)
         let screens = NSScreen.screens.filter { $0.frame.intersects(selection) }
@@ -133,7 +157,7 @@ final class CaptureSelectionController {
         let selected = selection
         if let localMonitor { NSEvent.removeMonitor(localMonitor); self.localMonitor = nil }
         for panel in panels { panel.orderOut(nil); panel.close() }
-        panels.removeAll(); dragOrigin = nil; highlightedWindows.removeAll()
+        panels.removeAll(); dragOrigin = nil; highlightedWindows.removeAll(); latestScreenPoint = nil
         if let callback = windowPicked { windowPicked = nil; callback(cancelled ? nil : window) }
         if let completion = continuation {
             continuation = nil
@@ -159,11 +183,16 @@ private final class SelectionCanvas: NSView {
         addTrackingArea(area); tracking = area; super.updateTrackingAreas()
     }
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 { selectionOwner?.confirm() } else { selectionOwner?.down() }
+        guard let point = screenPoint(for: event) else { return }
+        if event.clickCount == 2 { selectionOwner?.confirm(at: point) } else { selectionOwner?.down(at: point) }
     }
-    override func mouseDragged(with event: NSEvent) { selectionOwner?.drag() }
-    override func mouseUp(with event: NSEvent) { selectionOwner?.up() }
-    override func mouseMoved(with event: NSEvent) { selectionOwner?.move() }
+    override func mouseDragged(with event: NSEvent) { if let point = screenPoint(for: event) { selectionOwner?.drag(at: point) } }
+    override func mouseUp(with event: NSEvent) { if let point = screenPoint(for: event) { selectionOwner?.up(at: point) } }
+    override func mouseMoved(with event: NSEvent) { if let point = screenPoint(for: event) { selectionOwner?.move(at: point) } }
+    private func screenPoint(for event: NSEvent) -> CGPoint? {
+        guard let eventWindow = event.window ?? window else { return nil }
+        return CaptureSelectionGeometry.screenPoint(eventLocationInWindow: event.locationInWindow, convertToScreen: { eventWindow.convertPoint(toScreen: $0) })
+    }
     override func draw(_ dirtyRect: NSRect) {
         guard let owner = selectionOwner else { return }
         NSColor.black.withAlphaComponent(0.32).setFill(); bounds.fill()
