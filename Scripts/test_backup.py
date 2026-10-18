@@ -201,6 +201,98 @@ class BackupTests(unittest.TestCase):
         path.write_bytes(b'changed')
         with self.assertRaisesRegex(backup_module.BackupError, 'SHA256'):
             self.run_backup()
+
+    def writer_package(self, relative='A1B2C3D4-自建 文本.txt', *, staged=False, physical=None):
+        request_id = str(uuid.uuid4())
+        base = ('Exchange/Staging/' + request_id) if staged else ('Exchange/Outgoing/' + request_id + '.gaoaction')
+        manifest = {'schemaVersion': 1, 'kind': 'request', 'requestID': request_id, 'action': 'text.translate',
+                    'sourceBundleID': 'com.gaoseries.GaoJieTu', 'targetBundleID': 'com.gaoseries.GaoJieTu',
+                    'createdAt': '2026-10-18T12:00:00Z', 'expiresAt': '2026-10-18T12:02:00Z',
+                    'nonce': base64.b64encode(bytes(32)).decode(), 'parameters': {'targetLanguage': 'en-US'}, 'references': [],
+                    'items': [{'id': 'text', 'relativePath': relative, 'uti': 'text/plain', 'byteCount': 6,
+                               'sha256': hashlib.sha256(b'hello\n').hexdigest()}]}
+        if physical is None:
+            physical = ('0-' + backup_module.safe_filename(pathlib.PurePosixPath(relative).name)) if staged else ('payload/' + relative)
+        path = self.root / base / physical
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_bytes(b'hello\n')
+        path.chmod(0o600)
+        self.write_json(base + '/manifest.json', manifest)
+        if staged:
+            self.write_json('Exchange/ProcessedRequests.json', {'schemaVersion': 1, 'records': []})
+        return base, manifest, path
+
+    def test_writer_bare_relative_path_backup_and_restore(self):
+        base, manifest, path = self.writer_package()
+        report = self.run_backup()
+        self.assertEqual(report['integrity']['outgoingPackages'], 1)
+        self.assertTrue(report['restoreRehearsal'])
+        self.assertEqual(report['inventory'][base + '/payload/' + manifest['items'][0]['relativePath']]['sha256'],
+                         hashlib.sha256(b'hello\n').hexdigest())
+
+    def test_writer_staging_uses_indexed_safe_last_component(self):
+        base, manifest, path = self.writer_package('folder/A1B2C3D4-自建 文本.txt', staged=True)
+        report = self.run_backup()
+        self.assertEqual(report['integrity']['stagedPackages'], 1)
+        self.assertIn(base + '/0-A1B2C3D4-自建 文本.txt', report['inventory'])
+
+    def test_writer_nested_relative_path_is_payload_rooted(self):
+        self.writer_package('folder/subfolder/A1B2C3D4-note.txt')
+        self.assertEqual(self.run_backup()['integrity']['outgoingPackages'], 1)
+
+    def test_legacy_prefix_requires_unambiguous_physical_match(self):
+        self.writer_package('payload/input.txt', physical='payload/input.txt')
+        self.assertEqual(self.run_backup()['integrity']['outgoingPackages'], 1)
+
+    def test_literal_payload_subfolder_is_canonical_when_unambiguous(self):
+        self.writer_package('payload/input.txt')
+        self.assertEqual(self.run_backup()['integrity']['outgoingPackages'], 1)
+
+    def test_ambiguous_new_and_legacy_payload_paths_are_rejected(self):
+        base, manifest, path = self.writer_package('payload/input.txt')
+        legacy = self.root / base / 'payload/input.txt'
+        legacy.write_bytes(b'hello\n')
+        with self.assertRaisesRegex(backup_module.BackupError, '歧义'):
+            self.run_backup()
+
+    def test_legacy_alias_cannot_repeat_a_bare_path_attachment(self):
+        base, manifest, path = self.writer_package('input.txt')
+        duplicate = dict(manifest['items'][0], id='duplicate', relativePath='payload/input.txt')
+        manifest['items'].append(duplicate)
+        self.write_json(base + '/manifest.json', manifest)
+        with self.assertRaisesRegex(backup_module.BackupError, '同一文件'):
+            self.run_backup()
+
+    def test_bare_relative_path_digest_mismatch_and_missing_are_rejected(self):
+        base, manifest, path = self.writer_package()
+        path.write_bytes(b'other\n')
+        with self.assertRaisesRegex(backup_module.BackupError, 'SHA256'):
+            self.run_backup()
+        path.unlink()
+        with self.assertRaisesRegex(backup_module.BackupError, '附件缺失'):
+            self.run_backup()
+
+    def test_bare_relative_path_symlink_and_hardlink_are_rejected(self):
+        base, manifest, path = self.writer_package()
+        path.unlink()
+        external = self.base / 'SelfGeneratedPayload.txt'
+        external.write_bytes(b'hello\n')
+        path.symlink_to(external)
+        with self.assertRaises(backup_module.BackupError):
+            self.run_backup()
+        path.unlink()
+        os.link(external, path)
+        with self.assertRaises(backup_module.BackupError):
+            self.run_backup()
+
+    def test_bare_relative_path_traversal_and_absolute_still_rejected(self):
+        base, manifest, path = self.writer_package()
+        for relative in ('../input.txt', 'folder/../../input.txt', '/input.txt', 'folder//input.txt', 'folder/./input.txt'):
+            with self.subTest(relative=relative):
+                manifest['items'][0]['relativePath'] = relative
+                self.write_json(base + '/manifest.json', manifest)
+                with self.assertRaises(backup_module.BackupError):
+                    self.run_backup()
     def test_traversal_record_and_destination_rejected(self):
         attachment, asset = self.history()
         asset['outputPath'] = 'History/../Settings.json'

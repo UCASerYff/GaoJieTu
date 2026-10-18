@@ -184,7 +184,9 @@ struct RecordingTimeline {
     }
     mutating func adjusted(_ timestamp: CMTime, canStart: Bool) -> CMTime? {
         guard pausedAt == nil, timestamp.isNumeric else { return nil }
-        if anchor == nil && canStart { anchor = timestamp }
+        // The first sample may arrive after a pause. Anchor in the already pause-adjusted
+        // clock so pauses before any media do not get subtracted again from future samples.
+        if anchor == nil && canStart { anchor = timestamp - removedDuration }
         guard let anchor else { return nil }
         let result = timestamp - anchor - removedDuration
         return result >= .zero && result.isNumeric ? result : nil
@@ -193,5 +195,27 @@ struct RecordingTimeline {
         guard let anchor else { return nil }
         let result = (pausedAt ?? hostTime) - anchor - removedDuration
         return result.isNumeric && result >= .zero ? result : nil
+    }
+}
+
+/// Pure route identity policy, separate from CoreAudio queries so missing/changing routes are testable without audio devices.
+struct RecordingOutputRouteGuard {
+    private(set) var deviceID: UInt32
+
+    init(currentDeviceID: UInt32?) throws {
+        guard let currentDeviceID, currentDeviceID != 0 else {
+            throw RecordingError.sourceUnavailable("无法核验当前系统音频输出设备，未开始录制。")
+        }
+        deviceID = currentDeviceID
+    }
+
+    /// A true result requires the controller to pause and let the user review before continuing.
+    mutating func observe(currentDeviceID: UInt32?) throws -> Bool {
+        guard let currentDeviceID, currentDeviceID != 0 else {
+            throw RecordingError.sourceUnavailable("系统音频输出设备不可用；已停止以便核对音源")
+        }
+        guard currentDeviceID != deviceID else { return false }
+        deviceID = currentDeviceID
+        return true
     }
 }

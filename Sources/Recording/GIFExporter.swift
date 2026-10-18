@@ -24,7 +24,9 @@ struct GIFOptions {
             throw RecordingError.invalidConfiguration("GIF 需 0–120 秒片段、1–30 fps、16–1920 像素；调色参数超出范围")
         }
         if let crop {
-            guard CGRect(x: 0, y: 0, width: 1, height: 1).contains(crop), crop.width > 0, crop.height > 0 else {
+            guard !crop.isNull, !crop.isInfinite,
+                  [crop.minX, crop.minY, crop.width, crop.height].allSatisfy({ $0.isFinite }),
+                  CGRect(x: 0, y: 0, width: 1, height: 1).contains(crop), crop.width > 0, crop.height > 0 else {
                 throw RecordingError.invalidConfiguration("GIF 裁剪区域无效")
             }
         }
@@ -33,8 +35,19 @@ struct GIFOptions {
             throw RecordingError.invalidConfiguration("GIF 超出 2.4 亿帧像素预算，请缩短时段、降低帧率或尺寸")
         }
     }
-    var frameCount: Int { max(1, Int(ceil(durationSeconds * Double(framesPerSecond)))) }
+    var frameCount: Int {
+        // UI estimates are evaluated while fields are being edited, before validate().
+        // Bound floating-point values before any conversion to Int; NaN/infinity and overflow must not trap.
+        guard durationSeconds.isFinite, durationSeconds > 0, durationSeconds <= 120,
+              (1...30).contains(framesPerSecond) else { return 0 }
+        return Int(ceil(durationSeconds * Double(framesPerSecond)))
+    }
     var estimate: GIFCapacityEstimate {
+        do { try validate() }
+        catch {
+            return GIFCapacityEstimate(frameCount: 0, estimatedMinimumBytes: 0, estimatedMaximumBytes: 0,
+                note: "当前 GIF 参数无效：\(error.localizedDescription)")
+        }
         let indexed = Int64(maximumWidth) * Int64(maximumHeight) * Int64(frameCount)
         return GIFCapacityEstimate(frameCount: frameCount, estimatedMinimumBytes: max(1024, indexed / 10),
             estimatedMaximumBytes: indexed + Int64(frameCount) * 1024,

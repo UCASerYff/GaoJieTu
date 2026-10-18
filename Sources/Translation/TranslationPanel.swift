@@ -46,13 +46,17 @@ struct TranslationPanel: View {
     let initialText: String
     let sourceLanguage: String
     let targetLanguage: String
-    let onCompletion: (LocalTranslationResult) -> Void
-    init(initialText: String = "", sourceLanguage: String = "auto", targetLanguage: String = "en", onCompletion: @escaping (LocalTranslationResult) -> Void = { _ in }) {
-        self.initialText = initialText; self.sourceLanguage = sourceLanguage; self.targetLanguage = targetLanguage; self.onCompletion = onCompletion
+    let identity: TranslationOperationIdentity
+    let onCompletion: (LocalTranslationResult, UUID, String?) -> Void
+    let onCancel: (UUID, String?) -> Void
+    init(initialText: String = "", sourceLanguage: String = "auto", targetLanguage: String = "en", operationID: UUID, requestID: String? = nil, onCompletion: @escaping (LocalTranslationResult, UUID, String?) -> Void = { _, _, _ in }, onCancel: @escaping (UUID, String?) -> Void = { _, _ in }) {
+        self.initialText = initialText; self.sourceLanguage = sourceLanguage; self.targetLanguage = targetLanguage
+        identity = TranslationOperationIdentity(operationID: operationID, requestID: requestID)
+        self.onCompletion = onCompletion; self.onCancel = onCancel
     }
     var body: some View {
         if #available(macOS 15.0, *) {
-            SystemTranslationPanel(initialText: initialText, initialSource: sourceLanguage, initialTarget: targetLanguage, onCompletion: onCompletion)
+            SystemTranslationPanel(initialText: initialText, initialSource: sourceLanguage, initialTarget: targetLanguage, identity: identity, onCompletion: onCompletion, onCancel: onCancel)
         } else {
             VStack(alignment: .leading, spacing: 12) { Text("本机翻译").font(.title2); Text(LocalTranslationError.requiresMacOS15.localizedDescription); Text("OCR 仍可离线使用；本应用不会自动将文字提交到云服务。").foregroundStyle(.secondary) }.padding(24)
         }
@@ -61,7 +65,9 @@ struct TranslationPanel: View {
 
 @available(macOS 15.0, *)
 private struct SystemTranslationPanel: View {
-    let onCompletion: (LocalTranslationResult) -> Void
+    let onCompletion: (LocalTranslationResult, UUID, String?) -> Void
+    let onCancel: (UUID, String?) -> Void
+    @State private var identity: TranslationOperationIdentity
     @State private var text: String
     @State private var source: String
     @State private var target: String
@@ -72,13 +78,14 @@ private struct SystemTranslationPanel: View {
     @State private var translated = ""
     @State private var errorMessage: String?
     @State private var isRunning = false
-    @State private var requestID = UUID()
+    @State private var attempt: TranslationAttempt?
     @State private var currentSession: TranslationSession?
     @State private var availabilityGeneration = UUID()
-    @State private var packageDownloadRequested = false
 
-    init(initialText: String, initialSource: String, initialTarget: String, onCompletion: @escaping (LocalTranslationResult) -> Void) {
-        _text = State(initialValue: initialText); _source = State(initialValue: initialSource); _target = State(initialValue: initialTarget); self.onCompletion = onCompletion
+    init(initialText: String, initialSource: String, initialTarget: String, identity: TranslationOperationIdentity, onCompletion: @escaping (LocalTranslationResult, UUID, String?) -> Void, onCancel: @escaping (UUID, String?) -> Void) {
+        _text = State(initialValue: initialText); _source = State(initialValue: initialSource); _target = State(initialValue: initialTarget)
+        _identity = State(initialValue: identity)
+        self.onCompletion = onCompletion; self.onCancel = onCancel
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -92,7 +99,7 @@ private struct SystemTranslationPanel: View {
             Text(availabilityText).font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button(pairStatus == .supported ? "下载语言包并翻译" : "翻译") { begin() }.disabled(isRunning || pairStatus == .unsupported || pairStatus == nil || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                if isRunning { ProgressView().controlSize(.small); Button("取消") { cancel() } }
+                if isRunning { ProgressView().controlSize(.small); Button("取消翻译") { cancel(notify: true) } }
                 Spacer()
             }
             if let errorMessage { Text(errorMessage).foregroundStyle(.red).textSelection(.enabled) }
@@ -106,30 +113,32 @@ private struct SystemTranslationPanel: View {
             if source != "auto", !languages.contains(source) { languages.append(source) }
             await refreshAvailability()
         }
-        .onChange(of: source) { Task { await refreshAvailability() } }
-        .onChange(of: target) { Task { await refreshAvailability() } }
-        .onChange(of: text) { pairStatus = nil; availabilityText = "正在检查语言组合…"; Task { await refreshAvailability() } }
+        .onChange(of: source) { inputChanged() }
+        .onChange(of: target) { inputChanged() }
+        .onChange(of: text) { inputChanged() }
         .translationTask(configuration) { session in
-            let active = requestID, input = text
+            guard let snapshot = attempt else { return }
             currentSession = session
             do {
                 try Task.checkCancellation()
                 try await session.prepareTranslation()
                 try Task.checkCancellation()
-                let response = try await session.translate(input)
+                guard attempt?.id == snapshot.id else { return }
+                let response = try await session.translate(snapshot.text)
                 try Task.checkCancellation()
-                guard active == requestID else { return }
+                guard attempt?.id == snapshot.id else { return }
                 var result = LocalTranslationResult(sourceText: response.sourceText, translatedText: response.targetText, sourceLanguage: response.sourceLanguage.minimalIdentifier, targetLanguage: response.targetLanguage.minimalIdentifier)
-                result.languagePackageDownloadRequested = packageDownloadRequested
-                translated = result.translatedText; onCompletion(result); isRunning = false
+                result.languagePackageDownloadRequested = snapshot.packageDownloadRequested
+                translated = result.translatedText; isRunning = false
+                onCompletion(result, snapshot.identity.operationID, snapshot.identity.requestID)
                 await refreshAvailability()
             } catch {
-                guard active == requestID else { return }
+                guard attempt?.id == snapshot.id else { return }
                 errorMessage = error.localizedDescription; isRunning = false
             }
-            currentSession = nil
+            if attempt?.id == snapshot.id { currentSession = nil }
         }
-        .onDisappear { cancel() }
+        .onDisappear { cancel(notify: false) }
     }
 
     private func languageName(_ code: String) -> String { "\(Locale.current.localizedString(forIdentifier: code) ?? code)（\(code)）" }
@@ -137,6 +146,7 @@ private struct SystemTranslationPanel: View {
         let generation = UUID(); availabilityGeneration = generation
         let result: LanguageAvailability.Status
         do {
+            guard text.count <= 100_000 else { pairStatus = nil; availabilityText = LocalTranslationError.tooLong.localizedDescription; return }
             if source == "auto" {
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { pairStatus = nil; availabilityText = "输入文字后检测语言。"; return }
                 result = try await LanguageAvailability().status(for: text, to: Locale.Language(identifier: target))
@@ -153,13 +163,19 @@ private struct SystemTranslationPanel: View {
     }
     private func begin() {
         guard text.count <= 100_000 else { errorMessage = LocalTranslationError.tooLong.localizedDescription; return }
-        errorMessage = nil; isRunning = true; requestID = UUID()
-        packageDownloadRequested = pairStatus == .supported
+        guard pairStatus == .installed || pairStatus == .supported, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        errorMessage = nil; translated = ""; isRunning = true
+        attempt = TranslationAttempt(identity: identity, text: text, sourceLanguage: source, targetLanguage: target, packageDownloadRequested: pairStatus == .supported)
         let new = TranslationSession.Configuration(source: source == "auto" ? nil : Locale.Language(identifier: source), target: Locale.Language(identifier: target))
         if configuration?.source == new.source && configuration?.target == new.target { configuration?.invalidate() } else { configuration = new }
     }
-    private func cancel() {
+    private func inputChanged() {
+        pairStatus = nil; translated = ""; availabilityText = "正在检查语言组合…"
+        Task { await refreshAvailability() }
+    }
+    private func cancel(notify: Bool) {
         if #available(macOS 26.0, *) { currentSession?.cancel() }
-        requestID = UUID(); configuration = nil; isRunning = false; currentSession = nil
+        attempt = nil; configuration = nil; isRunning = false; currentSession = nil
+        if notify { onCancel(identity.operationID, identity.requestID) }
     }
 }

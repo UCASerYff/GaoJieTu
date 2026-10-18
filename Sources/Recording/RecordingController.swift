@@ -23,7 +23,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
     private var timer: Timer?
     private var monitorTask: Task<Void, Never>?
     private var selectedMicrophoneID: String?
-    private var selectedOutputDeviceID: AudioDeviceID?
+    private var outputRoute: RecordingOutputRouteGuard?
     private var startedAt: Date?
 
     var isActive: Bool { [.preparing, .recording, .paused, .stopping].contains(state) }
@@ -70,10 +70,14 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
             try changeState(.preparing)
             elapsed = 0; metrics = RecordingMetrics(); lastOutputURL = nil
             activeConfiguration = configuration
+            outputRoute = nil
+            if configuration.systemAudio {
+                // Establish a known route before constructing a writer or starting capture.
+                outputRoute = try RecordingOutputRouteGuard(currentDeviceID: RecordingAudioRoute.currentOutputDeviceID())
+            }
             let plan = try RecordingFilePlan(outputURL: configuration.outputURL)
             filePlan = plan; recoveryURL = plan.journalURL
             selectedMicrophoneID = configuration.microphoneDeviceID ?? AVCaptureDevice.default(for: .audio)?.uniqueID
-            selectedOutputDeviceID = configuration.systemAudio ? RecordingAudioRoute.currentOutputDeviceID() : nil
             if configuration.microphone && selectedMicrophoneID == nil { throw RecordingError.sourceUnavailable("没有可用麦克风") }
             if configuration.isMicrophoneOnly {
                 if let requested = configuration.microphoneDeviceID, requested != AVCaptureDevice.default(for: .audio)?.uniqueID {
@@ -279,12 +283,13 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
                 throw RecordingError.sourceUnavailable("系统输入设备发生变化；已停止以免悄悄切换音源")
             }
         }
-        if config.systemAudio, let previous = selectedOutputDeviceID {
-            guard let current = RecordingAudioRoute.currentOutputDeviceID() else {
-                throw RecordingError.sourceUnavailable("系统音频输出设备不可用；已停止以便核对音源")
+        if config.systemAudio {
+            guard var route = outputRoute else {
+                throw RecordingError.sourceUnavailable("系统音频输出设备身份未建立；已停止以免切换到未知音源")
             }
-            if current != previous {
-                selectedOutputDeviceID = current
+            let changed = try route.observe(currentDeviceID: RecordingAudioRoute.currentOutputDeviceID())
+            outputRoute = route
+            if changed {
                 if state == .recording { pause() }
                 statusMessage = "耳机或系统音频输出设备发生变化，已暂停。请核对新音源后点击继续。"
             }

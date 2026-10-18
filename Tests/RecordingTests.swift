@@ -11,6 +11,124 @@ private func recordingExpect(_ condition: @autoclosure () -> Bool, _ message: St
     if !condition() { throw RecordingTestFailure(message: message) }
 }
 
+/// Pure models only: no writer/decoder, device query, screen enumeration, permission request or UI.
+func runRecordingAlgorithmTests() throws {
+    var early = RecordingTimeline()
+    early.pause(at: CMTime(seconds: 100, preferredTimescale: 48_000))
+    early.resume(at: CMTime(seconds: 103, preferredTimescale: 48_000))
+    let first = early.adjusted(CMTime(seconds: 104, preferredTimescale: 48_000), canStart: true)
+    try recordingExpect(first == .zero, "首帧前暂停被重复扣除，首个恢复样本未从零开始")
+    let later = early.adjusted(CMTime(seconds: 105, preferredTimescale: 48_000), canStart: true)
+    try recordingExpect(abs((later?.seconds ?? -1) - 1) < 0.0001, "首帧前暂停导致后续样本丢失或偏移")
+    early.pause(at: CMTime(seconds: 105, preferredTimescale: 48_000))
+    early.resume(at: CMTime(seconds: 108, preferredTimescale: 48_000))
+    try recordingExpect(abs((early.adjusted(CMTime(seconds: 108, preferredTimescale: 48_000), canStart: true)?.seconds ?? -1) - 1) < 0.0001,
+        "首帧前和首帧后的暂停修正不能累积漂移")
+    early.pause(at: CMTime(seconds: 109, preferredTimescale: 48_000))
+    try recordingExpect(abs((early.elapsed(at: CMTime(seconds: 115, preferredTimescale: 48_000))?.seconds ?? -1) - 2) < 0.0001,
+        "暂停时停止计时未冻结到暂停入口")
+
+    var repeated = RecordingTimeline()
+    repeated.pause(at: CMTime(seconds: 100, preferredTimescale: 48_000))
+    repeated.resume(at: CMTime(seconds: 102, preferredTimescale: 48_000))
+    repeated.pause(at: CMTime(seconds: 103, preferredTimescale: 48_000))
+    repeated.resume(at: CMTime(seconds: 106, preferredTimescale: 48_000))
+    try recordingExpect(repeated.adjusted(CMTime(seconds: 107, preferredTimescale: 48_000), canStart: false) == nil,
+        "视频首帧之前的音频错误建立了独立锚点")
+    try recordingExpect(repeated.adjusted(CMTime(seconds: 108, preferredTimescale: 48_000), canStart: true) == .zero,
+        "多个首帧前暂停错误推迟了时间轴")
+    let audio = repeated.adjusted(CMTime(seconds: 108.1, preferredTimescale: 48_000), canStart: false)
+    try recordingExpect(abs((audio?.seconds ?? -1) - 0.1) < 0.0001, "音视频未沿用同一修正锚点")
+
+    let invalidOptions = [
+        GIFOptions(startSeconds: .nan), GIFOptions(startSeconds: .infinity),
+        GIFOptions(durationSeconds: .nan), GIFOptions(durationSeconds: .infinity),
+        GIFOptions(durationSeconds: -.infinity), GIFOptions(durationSeconds: .greatestFiniteMagnitude),
+        GIFOptions(durationSeconds: -.greatestFiniteMagnitude),
+        GIFOptions(framesPerSecond: .max), GIFOptions(framesPerSecond: .min),
+        GIFOptions(maximumWidth: .max), GIFOptions(maximumHeight: .max),
+        GIFOptions(durationSeconds: 120, framesPerSecond: 30, maximumWidth: 64, maximumHeight: 64),
+        GIFOptions(crop: CGRect(x: CGFloat.infinity, y: 0, width: 1, height: 1))
+    ]
+    for (index, options) in invalidOptions.enumerated() {
+        let count = options.frameCount
+        let estimate = options.estimate
+        try recordingExpect((0...3600).contains(count), "GIF 帧数转换未保持安全上限（case \(index)）")
+        try recordingExpect(estimate.frameCount == 0 && estimate.estimatedMinimumBytes == 0 && estimate.estimatedMaximumBytes == 0,
+            "无效或溢出 GIF 参数产生了成功容量估计（case \(index)）")
+        var rejected = false
+        do { try options.validate() } catch { rejected = true }
+        try recordingExpect(rejected, "无效 GIF 参数通过校验")
+    }
+    let valid = GIFOptions(startSeconds: 0.25, durationSeconds: 1, framesPerSecond: 10, maximumWidth: 64, maximumHeight: 64)
+    try valid.validate()
+    try recordingExpect(valid.frameCount == 10 && valid.estimate.frameCount == 10 && valid.estimate.estimatedMaximumBytes > 0,
+        "安全估计改变了有效 GIF 帧数")
+
+    for missing: UInt32? in [nil, 0] {
+        var rejected = false
+        do { _ = try RecordingOutputRouteGuard(currentDeviceID: missing) } catch RecordingError.sourceUnavailable { rejected = true }
+        try recordingExpect(rejected, "系统音首次未知设备被当作可录制设备")
+    }
+    var route = try RecordingOutputRouteGuard(currentDeviceID: 42)
+    let unchanged = try route.observe(currentDeviceID: 42)
+    try recordingExpect(!unchanged, "未变化音源被错误判定为切换")
+    let changed = try route.observe(currentDeviceID: 43)
+    try recordingExpect(changed && route.deviceID == 43, "真实设备身份改变没有要求暂停复核")
+    for missing: UInt32? in [nil, 0] {
+        var rejected = false
+        do { _ = try route.observe(currentDeviceID: missing) } catch RecordingError.sourceUnavailable { rejected = true }
+        try recordingExpect(rejected && route.deviceID == 43, "设备消失后切换到未知来源或改写了原身份")
+    }
+    print("RecordingAlgorithmTests PASS: pre-anchor/repeated pauses, frozen pause time, 13 invalid GIF estimates, valid frame count, injected route missing/unchanged/changed/lost; no media or device access")
+}
+
+/// A generated-media regression for the data-loss branch only. No audio or screen/device APIs are called.
+func runRecordingFinalizationRetentionTests() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("GaoJieTu-TailRetentionTests-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700])
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let output = directory.appendingPathComponent("tail-backpressure.mov")
+    let configuration = RecordingConfiguration(mode: .video,
+        source: RecordingSource(kind: .display, displayID: 42, name: "自建像素，非屏幕采集"),
+        outputURL: output, systemAudio: false, microphone: false, frameRate: 30, maximumPixelDimension: 128)
+    let plan = try RecordingFilePlan(outputURL: output)
+    var readinessChecks = 0
+    let pipeline = try RecordingPipeline(configuration: configuration, plan: plan, width: 128, height: 96,
+        tailFrameReadiness: { _ in readinessChecks += 1; return false })
+    for index in 0..<5 {
+        let pts = CMTime(seconds: 100 + Double(index) / 30, preferredTimescale: 48_000)
+        let frame = try generatedRecordingVideoFrame(index: index, pts: pts)
+        pipeline.queue.sync { pipeline.append(frame, track: .video) }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    try recordingExpect(pipeline.snapshot().videoFrames > 0, "未写入任何自建样本，无法验证保留风险")
+    var failedInsteadOfCompleting = false
+    do { _ = try await pipeline.finish(atHostTime: CMTime(seconds: 102, preferredTimescale: 48_000)) }
+    catch { failedInsteadOfCompleting = error.localizedDescription.contains("尾帧") }
+    try recordingExpect(readinessChecks == 1 && failedInsteadOfCompleting, "尾帧背压未确定触发或不完整录制被报告为成功")
+    try recordingExpect(FileManager.default.fileExists(atPath: plan.partialURL.path), "尾帧背压删除了已有媒体")
+    try recordingExpect(!FileManager.default.fileExists(atPath: output.path), "尾帧不完整仍提交了最终成品")
+    let asset = AVURLAsset(url: plan.partialURL)
+    let tracks = try await asset.loadTracks(withMediaType: .video)
+    let duration = try await asset.load(.duration)
+    try recordingExpect(tracks.count == 1 && duration.isNumeric && duration.seconds > 0 && duration.seconds < 1,
+        "保留文件不是已有样本的真实短时长视频")
+    let generator = AVAssetImageGenerator(asset: asset)
+    let decoded = try generator.copyCGImage(at: .zero, actualTime: nil)
+    try recordingExpect(decoded.width == 128 && decoded.height == 96, "保留的媒体样本无法真实解码")
+    let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+    let journal = try decoder.decode(RecordingRecoveryRecord.self, from: Data(contentsOf: plan.journalURL))
+    try recordingExpect(journal.state == .failed && journal.failure?.contains("尾帧") == true,
+        "恢复说明未保留实际失败原因")
+    try recordingExpect(abs(journal.metrics.durationSeconds - duration.seconds) < 0.04,
+        "恢复说明伪报了未写入尾帧的时长")
+    let recovery = try await RecordingRecovery.inspect(journal: plan.journalURL)
+    try recordingExpect(recovery.canRecover && recovery.videoTracks == 1, "背压保留文件不能被现有恢复流程读取")
+    print("RecordingFinalizationRetentionTests PASS: forced tail backpressure returned failure; generated H.264 partial exists, first frame decoded128x96, actual duration \(duration.seconds)s, failure journal recoverable; no capture/playback")
+}
+
 /// Uses only generated pixels and generated PCM. Does not enumerate screens, capture the desktop, or open audio devices.
 func runRecordingTests() async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("GaoJieTu-RecordingTests-\(UUID().uuidString)")

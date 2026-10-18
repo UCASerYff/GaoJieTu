@@ -36,6 +36,8 @@ struct CaptureWindow: Identifiable {
     let processID: pid_t
     let frame: CGRect
     let isOnScreen: Bool
+    /// WindowServer front-to-back rank. Unknown order is not safe for hover hit-testing.
+    var zOrder: Int? = nil
 }
 
 struct CaptureCatalog {
@@ -70,6 +72,27 @@ struct CapturedFrame {
     var pixelSize: CGSize { CGSize(width: image.width, height: image.height) }
 }
 
+struct CaptureRegionPlan {
+    let sourceRect: CGRect
+    let pixelRect: CGRect
+}
+
+enum CaptureWindowHitTesting {
+    static func ranks(frontToBackIDs: [CGWindowID]) -> [CGWindowID: Int] {
+        var result: [CGWindowID: Int] = [:]
+        for (rank, id) in frontToBackIDs.enumerated() where result[id] == nil { result[id] = rank }
+        return result
+    }
+
+    static func frontmost(at point: CGPoint, windows: [CaptureWindow]) -> CaptureWindow? {
+        windows.enumerated().filter { $0.element.isOnScreen && $0.element.zOrder != nil && $0.element.frame.contains(point) }
+            .min { left, right in
+                let leftRank = left.element.zOrder!, rightRank = right.element.zOrder!
+                return leftRank == rightRank ? left.offset < right.offset : leftRank < rightRank
+            }?.element
+    }
+}
+
 enum CaptureGeometry {
     static func displayID(_ screen: NSScreen) -> CGDirectDisplayID? {
         (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
@@ -94,6 +117,22 @@ enum CaptureGeometry {
         guard x.isFinite, y.isFinite, width.isFinite, height.isFinite,
               width > 0, height > 0, width < CGFloat(Int.max), height < CGFloat(Int.max) else { throw CaptureFailure.budgetExceeded }
         return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    /// Snap both edges outward on the display's physical pixel grid, then clamp to its extent.
+    /// The returned source rectangle and output dimensions describe exactly the same pixels.
+    static func normalizedRegion(_ region: CGRect, displaySize: CGSize, scale: CGFloat) throws -> CaptureRegionPlan {
+        guard region.minX.isFinite, region.minY.isFinite, region.maxX.isFinite, region.maxY.isFinite,
+              displaySize.width.isFinite, displaySize.height.isFinite, displaySize.width > 0, displaySize.height > 0,
+              scale.isFinite, scale > 0 else { throw CaptureFailure.invalidRegion }
+        let clipped = region.standardized.intersection(CGRect(origin: .zero, size: displaySize))
+        guard !clipped.isNull, clipped.width > 0, clipped.height > 0 else { throw CaptureFailure.invalidRegion }
+        let snapped = try pixelRect(clipped, scale: scale)
+        let rightLimit = floor(displaySize.width * scale), bottomLimit = floor(displaySize.height * scale)
+        guard rightLimit.isFinite, bottomLimit.isFinite else { throw CaptureFailure.budgetExceeded }
+        let pixels = snapped.intersection(CGRect(x: 0, y: 0, width: rightLimit, height: bottomLimit))
+        guard !pixels.isNull, pixels.width >= 1, pixels.height >= 1 else { throw CaptureFailure.invalidRegion }
+        return CaptureRegionPlan(sourceRect: CGRect(x: pixels.minX / scale, y: pixels.minY / scale, width: pixels.width / scale, height: pixels.height / scale), pixelRect: pixels)
     }
 
     /// Used for raw bitmap sources; display capture itself is already rotated by ScreenCaptureKit.
@@ -123,6 +162,8 @@ final class CaptureService {
         guard screenPermissionGranted else { throw CaptureFailure.permissionRequired }
         let fresh = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         content = fresh
+        let orderedWindows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let ranks = CaptureWindowHitTesting.ranks(frontToBackIDs: orderedWindows.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
         let displays = fresh.displays.map { display -> CaptureDisplay in
             let screen = NSScreen.screens.first { CaptureGeometry.displayID($0) == display.displayID }
             let scale = screen?.backingScaleFactor ?? CGFloat(display.width) / max(1, display.frame.width)
@@ -131,7 +172,7 @@ final class CaptureService {
         }
         let windows = fresh.windows.filter { $0.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier && $0.frame.width > 1 && $0.frame.height > 1 }.map {
             CaptureWindow(id: $0.windowID, title: $0.title ?? "无标题窗口", applicationName: $0.owningApplication?.applicationName ?? "未知应用",
-                          processID: $0.owningApplication?.processID ?? 0, frame: $0.frame, isOnScreen: $0.isOnScreen)
+                          processID: $0.owningApplication?.processID ?? 0, frame: $0.frame, isOnScreen: $0.isOnScreen, zOrder: ranks[$0.windowID])
         }
         return CaptureCatalog(displays: displays, windows: windows)
     }
@@ -147,6 +188,7 @@ final class CaptureService {
         let bounds: CGRect
         let scale: CGFloat
         let description: String
+        var plannedPixelSize: CGSize?
         let configuration = SCStreamConfiguration()
         configuration.showsCursor = options.showsCursor
         configuration.ignoreShadowsSingleWindow = !options.includesShadow
@@ -163,8 +205,9 @@ final class CaptureService {
             scale = info.scale
             let local: CGRect
             if case .region(_, let region) = source {
-                local = region.standardized.intersection(CGRect(origin: .zero, size: display.frame.size))
-                guard !local.isNull, local.width >= 1, local.height >= 1 else { throw CaptureFailure.invalidRegion }
+                let plan = try CaptureGeometry.normalizedRegion(region, displaySize: display.frame.size, scale: scale)
+                local = plan.sourceRect
+                plannedPixelSize = plan.pixelRect.size
                 configuration.sourceRect = local
                 description = "区域 · \(info.name)"
             } else {
@@ -181,7 +224,9 @@ final class CaptureService {
             bounds = window.frame
             description = "窗口 · \(window.owningApplication?.applicationName ?? "") · \(window.title ?? "无标题")"
         }
-        let output = try CaptureGeometry.pixelRect(CGRect(origin: .zero, size: bounds.size), scale: scale)
+        let output: CGRect
+        if let plannedPixelSize { output = CGRect(origin: .zero, size: plannedPixelSize) }
+        else { output = try CaptureGeometry.pixelRect(CGRect(origin: .zero, size: bounds.size), scale: scale) }
         configuration.width = Int(output.width)
         configuration.height = Int(output.height)
         try CaptureGeometry.validateBudget(width: configuration.width, height: configuration.height, maximumPixels: options.maximumPixels, maximumBytes: options.maximumMemoryBytes)
@@ -213,9 +258,10 @@ final class CaptureService {
             guard !region.isNull, region.width > 0, region.height > 0 else { continue }
             try Task.checkCancellation()
             let scale = catalog.displays.first(where: { $0.id == display.displayID })?.scale ?? 1
+            let plan = try CaptureGeometry.normalizedRegion(region.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY), displaySize: display.frame.size, scale: scale)
             let config = SCStreamConfiguration()
-            config.sourceRect = region.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY)
-            config.width = Int(ceil(region.width * scale)); config.height = Int(ceil(region.height * scale))
+            config.sourceRect = plan.sourceRect
+            config.width = Int(plan.pixelRect.width); config.height = Int(plan.pixelRect.height)
             config.showsCursor = options.showsCursor
             config.ignoreShadowsDisplay = !options.includesShadow
             // SCStreamConfiguration's default background is transparent. Its CGColor property is
@@ -223,7 +269,7 @@ final class CaptureService {
             try CaptureGeometry.validateBudget(width: config.width, height: config.height, maximumPixels: options.maximumPixels, maximumBytes: options.maximumMemoryBytes)
             let filter = SCContentFilter(display: display, including: selected)
             let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            tiles.append((image, region, scale))
+            tiles.append((image, plan.sourceRect.offsetBy(dx: display.frame.minX, dy: display.frame.minY), scale))
         }
         let scale = tiles.map(\.2).max() ?? 1
         let visibleBounds = tiles.reduce(CGRect.null) { $0.union($1.1) }
@@ -248,12 +294,13 @@ final class CaptureService {
             let region = rect.standardized.intersection(display.frame)
             guard !region.isNull, region.width > 0, region.height > 0 else { continue }
             let frame = try await capture(.region(displayID: display.id, rectInDisplayPoints: region.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY)), options: immediate)
-            tiles.append((frame.image, region, frame.scale))
+            tiles.append((frame.image, frame.logicalBounds, frame.scale))
         }
         guard !tiles.isEmpty else { throw CaptureFailure.invalidRegion }
         let scale = tiles.map(\.2).max() ?? 1
-        let image = try Self.compose(tiles: tiles, bounds: rect.standardized, scale: scale, options: options)
-        return CapturedFrame(image: image, capturedAt: Date(), scale: scale, sourceDescription: "桌面区域 · \(tiles.count) 块显示器", colorSpaceName: "sRGB", elapsedMilliseconds: Date().timeIntervalSince(start) * 1000, logicalBounds: rect.standardized)
+        let visibleBounds = tiles.reduce(CGRect.null) { $0.union($1.1) }
+        let image = try Self.compose(tiles: tiles, bounds: visibleBounds, scale: scale, options: options)
+        return CapturedFrame(image: image, capturedAt: Date(), scale: scale, sourceDescription: "桌面区域 · \(tiles.count) 块显示器", colorSpaceName: "sRGB", elapsedMilliseconds: Date().timeIntervalSince(start) * 1000, logicalBounds: visibleBounds)
     }
 
     private static func compose(tiles: [(CGImage, CGRect, CGFloat)], bounds: CGRect, scale: CGFloat, options: CaptureOptions) throws -> CGImage {

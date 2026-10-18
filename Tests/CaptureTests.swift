@@ -116,4 +116,5 @@ func runCaptureTests() throws {
     try Data("broken metadata".utf8).write(to: metadataURL)
     do { try PinnedImagePersistence.write([], root: privateRoot); throw NSError(domain: "CaptureTests", code: 12) } catch CaptureFailure.unsupported {}
     print("Capture isolated: 1x/2x/rotation, overlap=56, stitched=96x224, peak-estimate=\(session.estimatedPeakMemoryBytes) bytes; PNG alpha and JPEG resize decoded.")
+    try runCaptureRegressionTests()
 }

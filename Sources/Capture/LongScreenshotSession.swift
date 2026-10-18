@@ -5,6 +5,18 @@ struct ScrollTargetIdentity: Equatable {
     let processID: pid_t
     let windowID: CGWindowID
     var frame: CGRect? = nil
+    /// User-selected scroll content in the top-left desktop point coordinate system.
+    var scrollRegion: CGRect? = nil
+}
+
+enum ScrollCaptureGeometry {
+    static func scrollAnchor(windowBounds: CGRect, selectedRegion: CGRect?) throws -> CGPoint {
+        func valid(_ rect: CGRect) -> Bool { rect.minX.isFinite && rect.minY.isFinite && rect.maxX.isFinite && rect.maxY.isFinite && rect.width > 0 && rect.height > 0 }
+        guard valid(windowBounds) else { throw CaptureFailure.invalidRegion }
+        let region = selectedRegion ?? windowBounds
+        guard valid(region), windowBounds.contains(region) else { throw CaptureFailure.invalidRegion }
+        return CGPoint(x: region.midX, y: region.midY)
+    }
 }
 
 enum ScrollCaptureState: Equatable {
@@ -31,6 +43,27 @@ struct ScrollSeamEstimate {
     let currentPreview: CGImage
 }
 
+struct ScrollSeamPreview {
+    let previousImage: CGImage
+    let currentImage: CGImage
+    let previousRect: CGRect
+    let currentRect: CGRect
+}
+
+enum ScrollSeamPreviewRenderer {
+    /// Both strips show the same end of the proposed overlap, including when overlap exceeds the preview limit.
+    /// For a zero overlap there are no common rows: show the two adjoining edges instead.
+    static func make(previous: CGImage, current: CGImage, overlapPixels: Int, maximumHeight: Int = 320) throws -> ScrollSeamPreview {
+        guard previous.width == current.width, overlapPixels >= 0, overlapPixels <= min(previous.height, current.height), maximumHeight > 0 else { throw CaptureFailure.invalidRegion }
+        let height = min(maximumHeight, overlapPixels > 0 ? overlapPixels : min(previous.height, current.height))
+        guard height > 0 else { throw CaptureFailure.invalidRegion }
+        let previousRect = CGRect(x: 0, y: previous.height - height, width: previous.width, height: height)
+        let currentRect = CGRect(x: 0, y: overlapPixels > 0 ? overlapPixels - height : 0, width: current.width, height: height)
+        guard let previousImage = previous.cropping(to: previousRect), let currentImage = current.cropping(to: currentRect) else { throw CaptureFailure.emptyImage }
+        return ScrollSeamPreview(previousImage: previousImage, currentImage: currentImage, previousRect: previousRect, currentRect: currentRect)
+    }
+}
+
 private struct ScrollFrameSegment {
     let image: CGImage
     let overlap: Int
@@ -51,6 +84,12 @@ final class LongScreenshotSession {
     private var segments: [ScrollFrameSegment] = []
     private var pendingImage: CGImage?
     var pendingFrameHeight: Int? { pendingImage?.height }
+
+    func pendingPreview(overlapPixels: Int) throws -> ScrollSeamPreview? {
+        guard let previous = segments.last?.image, let current = pendingImage else { return nil }
+        guard overlapPixels >= 0, overlapPixels < current.height else { throw CaptureFailure.invalidRegion }
+        return try ScrollSeamPreviewRenderer.make(previous: previous, current: current, overlapPixels: overlapPixels)
+    }
 
     init(target: ScrollTargetIdentity? = nil, budget: ScrollCaptureBudget = .init()) {
         self.target = target; self.budget = budget
@@ -116,7 +155,7 @@ final class LongScreenshotSession {
         guard let info = currentTargetWindow(), let rawBounds = info[kCGWindowBounds as String] as? [String: Any],
               let bounds = CGRect(dictionaryRepresentation: rawBounds as CFDictionary),
               let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: -downwardPoints, wheel2: 0, wheel3: 0) else { throw CaptureFailure.sourceMissing }
-        event.location = CGPoint(x: bounds.midX, y: bounds.midY)
+        event.location = try ScrollCaptureGeometry.scrollAnchor(windowBounds: bounds, selectedRegion: target.scrollRegion)
         event.postToPid(target.processID)
         try await Task.sleep(nanoseconds: 450_000_000)
         try Task.checkCancellation(); try validateCurrentTarget()
@@ -230,10 +269,8 @@ enum ScrollOverlapMatcher {
             confidence = min(confidence, 0.75)
         }
         let duplicate = identicalError < 0.003
-        let previewHeight = min(height, max(48, min(best.0, 320)))
-        guard let previewA = previous.cropping(to: CGRect(x: 0, y: height - previewHeight, width: previous.width, height: previewHeight)),
-              let previewB = current.cropping(to: CGRect(x: 0, y: 0, width: current.width, height: previewHeight)) else { throw CaptureFailure.emptyImage }
-        return ScrollSeamEstimate(overlapPixels: duplicate ? height : best.0, confidence: duplicate ? 1 : confidence, meanAbsoluteError: best.1, duplicate: duplicate, warnings: warnings, previousPreview: previewA, currentPreview: previewB)
+        let preview = try ScrollSeamPreviewRenderer.make(previous: previous, current: current, overlapPixels: duplicate ? height : best.0)
+        return ScrollSeamEstimate(overlapPixels: duplicate ? height : best.0, confidence: duplicate ? 1 : confidence, meanAbsoluteError: best.1, duplicate: duplicate, warnings: warnings, previousPreview: preview.previousImage, currentPreview: preview.currentImage)
     }
 
     private static func grayPixels(_ image: CGImage, width: Int) throws -> [UInt8] {

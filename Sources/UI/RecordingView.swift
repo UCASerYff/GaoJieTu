@@ -41,7 +41,7 @@ struct RecordingView:View {
                 HStack{Button("请求麦克风权限"){Task{let granted=await controller.requestMicrophonePermission();model.message=granted ? "麦克风已获权。":"麦克风未获权，请在系统设置中允许后重试。"}}.disabled(active);Button("麦克风系统设置"){NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)}}
                 Text(controller.statusMessage).textSelection(.enabled)
                 if audioOnly && microphone && !systemAudio {Text(String(format:"麦克风电平 %.0f dB",controller.microphonePowerDB)).font(.caption)}
-                if let url=controller.lastOutputURL {HStack{Text("已完成：\(url.lastPathComponent)");Button("显示文件"){NSWorkspace.shared.activateFileViewerSelecting([url])};Button("导出 M4A…"){exportAudio(url)}}}
+                if let url=controller.lastOutputURL {HStack{Text("已完成：\(url.lastPathComponent)");Button("显示文件"){NSWorkspace.shared.activateFileViewerSelecting([url])};Button("混音导出 M4A…"){exportAudio(url)}}}
                 if let recovery=controller.recoveryURL {Button("显示恢复材料"){NSWorkspace.shared.activateFileViewerSelecting([recovery])}}
                 HStack {Text("视频帧 \(controller.metrics.videoFrames) · 掉帧 \(controller.metrics.droppedVideoFrames) · 系统音缓冲 \(controller.metrics.systemAudioBuffers) · 麦克风缓冲 \(controller.metrics.microphoneBuffers)").font(.caption);Spacer();Button("恢复中断录制…"){recover()}.disabled(active)}
                 Divider()

@@ -11,6 +11,7 @@ struct OCRPDFValidation {
     var pageCount: Int
     var verifiedTextLines: Int
     var preservedPageGeometry: Bool
+    var rasterizedPages: [Int] = []
 }
 
 enum OCRExporter {
@@ -67,6 +68,7 @@ enum OCRExporter {
             image = orientation == 1 ? raw : CIContext(options: [.cacheIntermediates: false, .useSoftwareRenderer: true]).createCGImage(ci, from: ci.extent)
         }
         var geometry: [(CGRect, CGRect, Int)] = []
+        var rasterizedPages: [Int] = []
         let originalPDFKit = source.isPDF ? PDFDocument(data: original) : nil
         progress(OCRPDFExportProgress(phase: .writing, completedPages: 0, totalPages: source.pageCount))
         for number in 1...source.pageCount {
@@ -78,7 +80,8 @@ enum OCRExporter {
             let rotation = rawPage.map { ((Int($0.rotationAngle) % 360) + 360) % 360 } ?? 0
             let nativeText = originalPDFKit?.page(at: number - 1)?.string
             let hasNativeText = nativeText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            let correctedNativePage = hasNativeText && page?.lines.contains(where: { $0.userEdited }) == true
+            // A native header does not prove that an image-only body is searchable.
+            let rebuildNativePage = hasNativeText && page?.status == .completed && page.map { needsRebuiltNativeLayer($0, originalPage: originalPDFKit?.page(at: number - 1)) } == true
             var pageInfo: [String: Any] = [kCGPDFContextMediaBox as String: rectData(media), kCGPDFContextCropBox as String: rectData(crop)]
             if let rawPage {
                 pageInfo[kCGPDFContextBleedBox as String] = rectData(rawPage.getBoxRect(.bleedBox))
@@ -87,13 +90,16 @@ enum OCRExporter {
             }
             context.beginPDFPage(pageInfo as CFDictionary)
             if let rawPage {
-                if correctedNativePage { try drawRasterizedOriginal(rawPage, media: media, maxPixels: document.options.maxPixelsPerPage, to: context) }
+                if rebuildNativePage {
+                    try drawRasterizedOriginal(rawPage, media: media, maxPixels: document.options.maxPixelsPerPage, to: context)
+                    rasterizedPages.append(number)
+                }
                 else { context.drawPDFPage(rawPage) }
             }
             else if let image { context.draw(image, in: media) }
             if let page, page.status == .completed {
                 // Keep existing native PDF text instead of creating duplicate text layers.
-                if !hasNativeText || correctedNativePage {
+                if !hasNativeText || rebuildNativePage {
                     for line in page.lines { guard !cancellation.isCancelled else { throw CancellationError() }; drawInvisible(line: line, context: context) }
                 }
             }
@@ -109,7 +115,8 @@ enum OCRExporter {
             page.setBounds(boxes.0, for: .mediaBox); page.setBounds(boxes.1, for: .cropBox)
         }
         guard pdf.write(to: rotatedTemp) else { throw OCRError.validation("PDF 写入失败。") }
-        let validation = try validatePDF(at: rotatedTemp, sourceID: sourceID, document: document, geometry: geometry, cancellation: cancellation, progress: progress)
+        var validation = try validatePDF(at: rotatedTemp, sourceID: sourceID, document: document, geometry: geometry, cancellation: cancellation, progress: progress)
+        validation.rasterizedPages = rasterizedPages
         guard !cancellation.isCancelled else { throw CancellationError() }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: rotatedTemp.path)
         try FileManager.default.moveItem(at: rotatedTemp, to: destination)
@@ -136,7 +143,22 @@ enum OCRExporter {
         context.restoreGState()
     }
 
-    /// Corrected native-PDF pages become original visual pixels + one corrected text layer.
+    private static func needsRebuiltNativeLayer(_ ocrPage: OCRPage, originalPage: PDFPage?) -> Bool {
+        if ocrPage.lines.contains(where: { $0.userEdited }) { return true }
+        guard let originalPage else { return true }
+        return ocrPage.lines.contains { line in
+            let expected = normalizedText(line.text)
+            guard !expected.isEmpty else { return false }
+            let existing = originalPage.selection(for: line.pageBoundingBox.insetBy(dx: -2, dy: -2))?.string ?? ""
+            return !normalizedText(existing).contains(expected)
+        }
+    }
+
+    private static func normalizedText(_ value: String) -> String {
+        String(value.precomposedStringWithCanonicalMapping.lowercased().unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) })
+    }
+
+    /// Corrected or incompletely searchable native-PDF pages become original visual pixels + one OCR layer.
     /// This avoids retaining a conflicting old native text layer beneath the new OCR text.
     private static func drawRasterizedOriginal(_ page: CGPDFPage, media: CGRect, maxPixels: Int, to output: CGContext) throws {
         let scale = min(2, sqrt(Double(maxPixels) / (media.width * media.height)), 12_000 / max(media.width, media.height))

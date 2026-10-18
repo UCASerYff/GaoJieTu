@@ -39,7 +39,7 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
         }
         self.service = service; self.options = options; self.completion = onComplete
         self.source = .region(displayID: display.id, rectInDisplayPoints: region.desktopRect.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY))
-        self.session = LongScreenshotSession(target: ScrollTargetIdentity(processID: window.processID, windowID: window.id, frame: window.frame))
+        self.session = LongScreenshotSession(target: ScrollTargetIdentity(processID: window.processID, windowID: window.id, frame: window.frame, scrollRegion: region.desktopRect))
         // Explicitly selected product target, activated once. Subsequent controls never steal its focus.
         guard let app = NSRunningApplication(processIdentifier: window.processID), app.activate(options: []) else { throw CaptureFailure.sourceMissing }
         try await Task.sleep(nanoseconds: 350_000_000)
@@ -110,8 +110,6 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
     }
 
     private func showSeam(_ seam: ScrollSeamEstimate) {
-        previousPreview.image = NSImage(cgImage: seam.previousPreview, size: .zero)
-        currentPreview.image = NSImage(cgImage: seam.currentPreview, size: .zero)
         seamSlider.minValue = 0; seamSlider.maxValue = Double(max(1, (session?.pendingFrameHeight ?? 2) - 1))
         seamSlider.doubleValue = Double(seam.overlapPixels)
         previewStack?.isHidden = false; seamChanged()
@@ -125,7 +123,15 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
         acceptButton.isEnabled = !busy && pending; rejectButton.isEnabled = !busy && pending
     }
 
-    @objc private func seamChanged() { seamLabel.stringValue = "重叠高度：\(Int(seamSlider.doubleValue.rounded())) px（可调整后确认）" }
+    @objc private func seamChanged() {
+        let overlap = Int(seamSlider.doubleValue.rounded())
+        do {
+            guard let session, let preview = try session.pendingPreview(overlapPixels: overlap) else { return }
+            previousPreview.image = NSImage(cgImage: preview.previousImage, size: .zero)
+            currentPreview.image = NSImage(cgImage: preview.currentImage, size: .zero)
+            seamLabel.stringValue = overlap > 0 ? "重叠 \(overlap) px · 两侧对应重叠末尾 \(preview.currentImage.height) 行" : "重叠 0 px · 无共同行，请核对两侧直接相接"
+        } catch { status.stringValue = error.localizedDescription }
+    }
     @objc private func nextFrame() { captureNext(scroll: false) }
     @objc private func scrollFrame() { captureNext(scroll: true) }
     @objc private func acceptSeam() {

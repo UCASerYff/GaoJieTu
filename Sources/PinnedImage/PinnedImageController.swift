@@ -1,6 +1,12 @@
 import AppKit
 import ImageIO
 
+enum PinnedImageGeometry {
+    static func actualPixelScale(backingScale: CGFloat) -> CGFloat {
+        backingScale.isFinite && backingScale > 0 ? 1 / backingScale : 1
+    }
+}
+
 @MainActor
 final class PinnedImageController: NSObject {
     private var pins: [UUID: PinnedImageWindow] = [:]
@@ -259,7 +265,7 @@ private final class PinnedImageWindow: NSWindowController, NSWindowDelegate {
     @objc private func closePin() { close() }
     @objc private func zoomIn() { zoom(by: 1.2) }
     @objc private func zoomOut() { zoom(by: 1 / 1.2) }
-    @objc private func actualPixels() { zoom(by: 1 / imageScale) }
+    @objc private func actualPixels() { zoom(by: PinnedImageGeometry.actualPixelScale(backingScale: window?.backingScaleFactor ?? 1) / imageScale) }
     @objc private func toggleTopmost() { window?.level = window?.level == .floating ? .normal : .floating }
     @objc private func enablePassThrough() { window?.ignoresMouseEvents = true; onNotice?("此贴图已开启鼠标穿透；可在主界面选择“贴图恢复交互”。") }
     @objc private func changeOpacity(_ sender: NSMenuItem) { window?.alphaValue = CGFloat(sender.tag) / 100; savePositionIfRemembered() }

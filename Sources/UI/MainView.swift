@@ -7,7 +7,7 @@ struct MainView:View {
         NavigationSplitView {
             List(selection:$model.tab){Label("截图",systemImage:"viewfinder").tag("截图");Label("标注",systemImage:"pencil.tip.crop.circle").tag("标注");Label("OCR",systemImage:"text.viewfinder").tag("OCR");Label("录屏与录音",systemImage:"record.circle").tag("录制");Label("翻译",systemImage:"character.bubble").tag("翻译");Label("历史与交接",systemImage:"clock").tag("历史")}.navigationSplitViewColumnWidth(160)
         } detail: {
-            VStack(spacing:0){content.frame(maxWidth:.infinity,maxHeight:.infinity);Divider();HStack{if model.busy{ProgressView().controlSize(.small)};if model.captureTask != nil{Button("取消处理"){model.cancelCaptureWork()}};Text(model.message).font(.callout).textSelection(.enabled);Spacer();if model.externalAnnotation != nil || model.externalTranslation != nil || model.exchange.isExecuting{Button("取消交接"){model.exchange.cancelPending()}}}.padding(12).frame(minHeight:48)}
+            VStack(spacing:0){content.frame(maxWidth:.infinity,maxHeight:.infinity);Divider();HStack{if model.busy{ProgressView().controlSize(.small)};if model.captureTask != nil{Button("取消处理"){model.cancelCaptureWork()}};Text(model.message).font(.callout).textSelection(.enabled);Spacer();if model.exchange.canCancelCurrentOperation{Button("取消交接"){model.exchange.cancelPending()}}}.padding(12).frame(minHeight:48)}
         }
         .sheet(isPresented:$model.chooser,onDismiss:{if model.choiceContinuation != nil{model.choose(nil)}}){CaptureChooser(model:model).frame(width:640,height:450)}
     }
@@ -17,7 +17,7 @@ struct MainView:View {
         case "标注":AnnotationView(model:model)
         case "OCR":OCRView(model:model,controller:model.ocr)
         case "录制":RecordingView(model:model,controller:model.recording)
-        case "翻译":TranslationPanel(initialText:model.translationText,sourceLanguage:model.translationSource,targetLanguage:model.translationTarget,onCompletion:{result in model.exchange.translationCompleted(result)}).id(model.translationText+model.translationSource+model.translationTarget)
+        case "翻译":TranslationPanel(initialText:model.translationText,sourceLanguage:model.translationSource,targetLanguage:model.translationTarget,operationID:model.translationOperationID,requestID:model.externalTranslation?.manifest.requestID,onCompletion:{result,id,requestID in model.exchange.translationCompleted(result,operationID:id,requestID:requestID)},onCancel:{id,requestID in model.exchange.cancelTranslation(operationID:id,requestID:requestID)}).id(model.translationOperationID)
         case "历史":HistoryView(model:model,store:model.store)
         default:EmptyView()
         }

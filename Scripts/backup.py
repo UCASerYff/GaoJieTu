@@ -243,14 +243,29 @@ def validate_package(root, base, files, *, staged=False):
             manifest.get('action') in KNOWN_ACTIONS, '交接包主记录身份或动作无效')
     items = manifest.get('items')
     require(isinstance(items, list) and len(items) <= 256, '交接附件列表无效')
-    paths, total = set(), 0
+    paths, targets, total = set(), set(), 0
     for index, item in enumerate(items):
         require(isinstance(item, dict), '交接附件记录损坏')
         relative = item.get('relativePath')
         parts = safe_relative(relative)
-        require(len(parts) >= 2 and parts[0] == 'payload' and relative not in paths, '交接附件不在 payload 内或重复')
+        require(relative not in paths, '交接附件路径重复')
         paths.add(relative)
-        target = base + '/' + (str(index) + '-' + safe_filename(parts[-1]) if staged else relative)
+        if staged:
+            # GaoActionTransport flattens private copies to <index>-<safe last component>.
+            target = base + '/' + str(index) + '-' + safe_filename(parts[-1])
+        else:
+            # V1 paths are relative to the payload directory, not the package root.
+            target = base + '/payload/' + relative
+            if len(parts) >= 2 and parts[0] == 'payload':
+                # Older local packages included the payload/ prefix. Accept only one existing
+                # physical file; never guess between a canonical nested payload folder and legacy.
+                legacy = base + '/' + relative
+                candidates = [candidate for candidate in (target, legacy) if candidate in files]
+                require(len(candidates) <= 1, '交接附件新旧路径解释有歧义，停止备份')
+                if candidates:
+                    target = candidates[0]
+        require(target not in targets, '交接附件多条路径指向同一文件，停止备份')
+        targets.add(target)
         check_attachment(files, target, item.get('sha256'), item.get('byteCount'))
         require(valid_sha(item.get('sha256')) and integer(item.get('byteCount'), 0, 2_147_483_648), '交接附件缺少摘要或大小')
         total += item['byteCount']

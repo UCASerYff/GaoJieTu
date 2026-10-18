@@ -106,7 +106,7 @@ struct OCRView: View {
                     Divider()
                     ForEach(document.sources) { source in Button("可搜索 PDF：\(source.displayName)") { exportPDF(source) }.disabled(source.sha256.isEmpty) }
                 }
-                Button("翻译结果") { model.translationText = document.text; model.tab = "翻译" }.disabled(document.text.isEmpty)
+                Button("翻译结果") { model.setTranslationInput(document.text) }.disabled(document.text.isEmpty)
             }.disabled(controller.isRunning || isExporting)
         }
     }
@@ -155,7 +155,8 @@ struct OCRView: View {
                         Task { @MainActor in if generation == exportGeneration { exportProgress = value } }
                     }
                 }.value
-                model.message = "已验证 \(validation.pageCount) 页、\(validation.verifiedTextLines) 行文本层、检索与页面位置。"
+                let rebuilt = validation.rasterizedPages.isEmpty ? "" : "其中\(validation.rasterizedPages.count)页已按原页图像重建完整文字层；原件保留。"
+                model.message = "已验证 \(validation.pageCount) 页、\(validation.verifiedTextLines) 行文本层、检索与页面位置。" + rebuilt
             } catch is CancellationError { model.message = "PDF 导出已取消；原件保留，未完成输出已清理。" }
             catch { model.fail(error) }
         }
@@ -172,7 +173,7 @@ private struct OCRCorrectionView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("校正识别文字").font(.title2)
             Text("每行点击“应用”才写入当前 OCR 文档。原识别文字、Vision 置信度、原件 SHA 与坐标保留；导出使用已应用的文字，原图不改。").font(.callout).foregroundStyle(.secondary)
-            Text("校正原生文字 PDF 的对应页会按安全像素预算保留为页面图像并重建文字层，避免检索命中旧文字；原 PDF 保留。").font(.caption).foregroundStyle(.secondary)
+            Text("校正或原生文字层不完整的 PDF 页会按安全像素预算保留为页面图像并重建完整文字层，避免旧文字冲突或扫描正文不可检索；原 PDF 保留。").font(.caption).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
                     if let document = controller.document {

@@ -15,6 +15,7 @@ final class RecordingPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unch
     private let videoInput: AVAssetWriterInput?
     private let systemInput: AVAssetWriterInput?
     private let microphoneInput: AVAssetWriterInput?
+    private let tailFrameReadiness: (AVAssetWriterInput) -> Bool
     private let startedAt = Date()
     private let initialCPU = RecordingPipeline.cpuTime()
     private var timeline = RecordingTimeline()
@@ -30,9 +31,11 @@ final class RecordingPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unch
     private var recovery: RecordingRecoveryRecord
     var onFailure: ((Error) -> Void)?
 
-    init(configuration: RecordingConfiguration, plan: RecordingFilePlan, width: Int, height: Int) throws {
+    init(configuration: RecordingConfiguration, plan: RecordingFilePlan, width: Int, height: Int,
+         tailFrameReadiness: @escaping (AVAssetWriterInput) -> Bool = { $0.isReadyForMoreMediaData }) throws {
         self.configuration = configuration
         self.plan = plan
+        self.tailFrameReadiness = tailFrameReadiness
         writer = try AVAssetWriter(outputURL: plan.partialURL, fileType: .mov)
         writer.shouldOptimizeForNetworkUse = false
         if configuration.mode == .video {
@@ -153,6 +156,7 @@ final class RecordingPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unch
                 recovery.state = .stopping
                 recovery.failure = failure?.localizedDescription
                 updateJournal()
+                var finalizationFailure: Error? = failure ?? lastFailure
                 guard started else {
                     recovery.state = .failed
                     let reason = failure ?? lastFailure ?? RecordingError.noSamples
@@ -167,7 +171,7 @@ final class RecordingPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unch
                     continuation.resume(throwing: error)
                     return
                 }
-                if failure == nil, let hostTime = atHostTime, let end = timeline.elapsed(at: hostTime), end > lastEnd,
+                if finalizationFailure == nil, let hostTime = atHostTime, let end = timeline.elapsed(at: hostTime), end > lastEnd,
                    let videoInput, let lastVideoBuffer, let image = CMSampleBufferGetImageBuffer(lastVideoBuffer),
                    let format = CMSampleBufferGetFormatDescription(lastVideoBuffer) {
                     // SCK omits unchanged desktop frames. Hold the last real frame through the user's stop time.
@@ -178,26 +182,33 @@ final class RecordingPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unch
                     var heldFrame: CMSampleBuffer?
                     let code = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: image,
                         formatDescription: format, sampleTiming: &timing, sampleBufferOut: &heldFrame)
-                    if code == noErr, let heldFrame, videoInput.isReadyForMoreMediaData, videoInput.append(heldFrame) {
+                    if code == noErr, let heldFrame, tailFrameReadiness(videoInput), videoInput.append(heldFrame) {
                         metrics.videoFrames += 1; lastEnd = end; metrics.durationSeconds = end.seconds
                     } else {
-                        let error = writer.error ?? RecordingError.writing("静止画面的最终时长无法写入；中间文件已保留")
+                        let error = writer.error ?? RecordingError.writing("尾帧未能写入，实际录制时长可能不完整；已有媒体保留为中间文件，请通过恢复功能核验。")
+                        finalizationFailure = error
                         recovery.state = .failed; recovery.failure = error.localizedDescription; updateJournal()
-                        writer.cancelWriting()
-                        continuation.resume(throwing: error)
-                        return
+                        // cancelWriting deletes the output. Finish already accepted samples instead,
+                        // and still report failure so incomplete media is never committed as completed.
                     }
+                }
+                guard writer.status == .writing else {
+                    let error = writer.error ?? finalizationFailure ?? RecordingError.writing("已有媒体容器无法继续完成；恢复说明与可能存在的中间文件已保留。")
+                    recovery.state = .failed; recovery.failure = error.localizedDescription; updateJournal()
+                    continuation.resume(throwing: error)
+                    return
                 }
                 for input in [videoInput, systemInput, microphoneInput].compactMap({ $0 }) { input.markAsFinished() }
                 writer.endSession(atSourceTime: lastEnd)
-                writer.finishWriting { [self] in
-                    queue.async { [self] in
+                let reportedFailure = finalizationFailure ?? lastFailure
+                writer.finishWriting { [self, reportedFailure] in
+                    queue.async { [self, reportedFailure] in
                         metrics.processCPUSeconds = Self.cpuTime() - initialCPU
                         if writer.status == .completed {
                             let missingVideo = configuration.mode == .video && metrics.videoFrames == 0
                             let missingSystem = configuration.systemAudio && metrics.systemAudioBuffers == 0
                             let missingMic = configuration.microphone && metrics.microphoneBuffers == 0
-                            if let failure = failure ?? ((missingVideo || missingSystem || missingMic) ? RecordingError.noSamples : nil) {
+                            if let failure = reportedFailure ?? ((missingVideo || missingSystem || missingMic) ? RecordingError.noSamples : nil) {
                                 recovery.state = .failed; recovery.failure = failure.localizedDescription; updateJournal()
                                 continuation.resume(throwing: failure)
                             } else { continuation.resume(returning: metrics) }

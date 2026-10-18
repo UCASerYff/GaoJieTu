@@ -90,9 +90,7 @@ final class CaptureSelectionController {
     private func windowAtMouse() -> CaptureWindow? {
         let mouse = NSEvent.mouseLocation
         let desktopPoint = CGPoint(x: mouse.x, y: mainTop - mouse.y)
-        // SCShareableContent's window order is the server's catalog order; prefer the smallest hit window
-        // when the catalog cannot guarantee the real z-order. The outline makes the exact choice visible.
-        return highlightedWindows.filter { $0.frame.contains(desktopPoint) }.min { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+        return CaptureWindowHitTesting.frontmost(at: desktopPoint, windows: highlightedWindows)
     }
 
     fileprivate var appKitSelection: CGRect {
@@ -102,6 +100,7 @@ final class CaptureSelectionController {
 
     fileprivate var selectionLabel: String {
         if let window = windowAtMouse(), !highlightedWindows.isEmpty { return "\(window.applicationName) · \(window.title)\n单击选择 · Esc 取消" }
+        if !highlightedWindows.isEmpty { return "此处没有可确认前后顺序的窗口\n移动到目标窗口 · Esc 取消" }
         let desktop = CaptureGeometry.appKitToDesktop(selection, mainDisplayTop: mainTop)
         let screens = NSScreen.screens.filter { $0.frame.intersects(selection) }
         let pixels = screens.map { screen -> String in

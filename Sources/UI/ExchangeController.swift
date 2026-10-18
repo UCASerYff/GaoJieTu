@@ -20,8 +20,14 @@ final class ExchangeController {
     private var ledger: GaoProcessedRequestStore?
     private var active = false
     private var ocrCancellation: OCRCancellationToken?
+    private var externalCapture: ActionTaskHandle<CapturedFrame?>?
     private var sending = Set<String>()
     var isExecuting: Bool { active || !sending.isEmpty }
+    var canCancelCurrentOperation: Bool {
+        (externalCapture != nil && externalCapture?.isCancelled == false) ||
+        (ocrCancellation != nil && ocrCancellation?.isCancelled == false) ||
+        model.externalAnnotation != nil || model.externalTranslation != nil
+    }
 
     init(model: AppModel) {
         self.model = model
@@ -81,7 +87,11 @@ final class ExchangeController {
         case "capture.region", "capture.window", "capture.display":
             let oldDelay = model.delay; defer { model.delay = oldDelay }
             model.delay = manifest.parameters["delaySeconds"]?.numberValue ?? 0
-            guard let frame = try await model.performCapture(manifest.action) else { try finish(package, status: "cancelled", provenance: [:]); return }
+            let operation = ActionTaskHandle<CapturedFrame?>(requestID: manifest.requestID) { [model] in try await model.performCapture(manifest.action) }
+            externalCapture = operation
+            defer { if externalCapture === operation { externalCapture = nil } }
+            model.message = "外部捕获已确认；可取消交接，取消后的迟到画面不会保存或回送。"
+            guard let frame = try await operation.value() else { try finish(package, status: "cancelled", provenance: [:]); return }
             let url = try output(package, name: "capture.png", data: pngData(frame.image))
             try finish(package, status: "completed", files: [.init(url: url, uti: "public.png")], provenance: ["pixelWidth": .number(Double(frame.image.width)), "pixelHeight": .number(Double(frame.image.height)), "scale": .number(Double(frame.scale)), "colorSpace": .string(frame.colorSpaceName), "source": .string(frame.sourceDescription)])
             model.annotation = AnnotationDocument(image: frame.image); model.tab = "标注"; model.showMain()
@@ -113,6 +123,7 @@ final class ExchangeController {
             model.translationText = text
             model.translationSource = manifest.parameters["sourceLanguage"]?.stringValue ?? "auto"
             model.translationTarget = manifest.parameters["targetLanguage"]?.stringValue ?? "en"
+            model.translationOperationID = UUID()
             model.externalTranslation = package; model.tab = "翻译"
             try sendPending(package, workflow: "awaitingUser")
         case "ocr.files": try await performOCR(package)
@@ -132,6 +143,14 @@ final class ExchangeController {
         model.message = "交接 OCR 正在检查原件；“取消交接”可取消本批任务。"
         let document = try await OCRService().recognize(urls: package.stagedItems.map(\.url), options: options, cancellation: cancellation) { [weak model] progress in
             Task { @MainActor in model?.message = "交接 OCR：\(progress.completedPages)/\(progress.totalPages) 页；可取消交接。" }
+        }
+        // Keep completed work before a cancellable PDF export. It is local recovery, not a new requested output.
+        var recoveryURL: URL?
+        if formats.contains("searchablePDF") || document.isPartial || document.wasCancelled {
+            let url = try outputURL(package, name: "OCR-recovery.json")
+            let mappings = zip(document.sources, package.stagedItems).map { OCRRecoverySource(sourceID: $0.0.id, sourceItemID: $0.1.item.id, sourceSHA256: $0.1.item.sha256) }
+            _ = try await Task.detached(priority: .userInitiated) { try OCRRecoveryStore.save(document: document, requestID: manifest.requestID, sources: mappings, to: url) }.value
+            recoveryURL = url
         }
         var files: [GaoOutgoingFile] = []
         var failures: [String] = []
@@ -185,7 +204,10 @@ final class ExchangeController {
         else if document.successfulPages == 0 { status = "failed" }
         else { status = document.isPartial || !failures.isEmpty ? "partial" : "completed" }
         let errorCode = status == "completed" ? nil : status == "cancelled" ? "userCancelled" : "pageOrExportFailed"
-        try finish(package, status: status, files: files, error: errorCode, provenance: ["sources": .array(sourceRecords), "outputs": .array(outputRecords), "engine": .string(document.engine), "engineRevision": .number(Double(document.engineRevision)), "networkUsed": .bool(false), "exportFailures": .array(failures.map(GaoJSONValue.string))])
+        var provenance: [String: GaoJSONValue] = ["sources": .array(sourceRecords), "outputs": .array(outputRecords), "engine": .string(document.engine), "engineRevision": .number(Double(document.engineRevision)), "networkUsed": .bool(false), "exportFailures": .array(failures.map(GaoJSONValue.string))]
+        if recoveryURL != nil, status != "completed" { provenance["localRecovery"] = .object(["available": .bool(true), "filename": .string("OCR-recovery.json"), "requestID": .string(manifest.requestID)]) }
+        try finish(package, status: status, files: files, error: errorCode, provenance: provenance)
+        if let recoveryURL, status == "completed" { try? FileManager.default.removeItem(at: recoveryURL) }
     }
 
     func completeAnnotation(_ package: GaoValidatedPackage, url: URL) throws {
@@ -194,8 +216,10 @@ final class ExchangeController {
         try finish(package, status: "completed", files: [.init(url: url, uti: UTType(filenameExtension: url.pathExtension)?.identifier ?? "public.png")], provenance: ["sourceItemID": .string(package.manifest.items[0].id), "sourceSHA256": .string(package.manifest.items[0].sha256), "flattened": .bool(true)])
     }
 
-    func translationCompleted(_ result: LocalTranslationResult) {
-        guard let package = model.externalTranslation else { return }
+    func translationCompleted(_ result: LocalTranslationResult, operationID: UUID, requestID: String?) {
+        let identity = TranslationOperationIdentity(operationID: operationID, requestID: requestID)
+        guard identity.matches(operationID: model.translationOperationID, requestID: model.externalTranslation?.manifest.requestID),
+              let package = model.externalTranslation, requestID == package.manifest.requestID else { return }
         do {
             // A completed result must correspond to the approved original input and requested language.
             let original = try GaoPrivateIO.read(GaoPrivateIO.regularURL(package.stagedItems[0].url), maximum: GaoActionContract.maximumTextBytes)
@@ -211,12 +235,30 @@ final class ExchangeController {
     }
 
     func cancelPending() {
-        if let ocrCancellation { ocrCancellation.cancel(); model.message = "正在取消外部 OCR；已完成页将保留为部分结果。" }
-        for package in [model.externalAnnotation, model.externalTranslation].compactMap({ $0 }) {
-            do { try finish(package, status: "cancelled", provenance: [:]) }
-            catch { model.fail(error) }
+        if let operation = externalCapture {
+            operation.cancel(); model.selection.cancel()
+            if model.choiceContinuation != nil { model.choose(nil) }
+            model.message = "正在取消外部捕获；不会保存或回送取消后的画面。"
         }
-        model.externalAnnotation = nil; model.externalTranslation = nil
+        if let ocrCancellation { ocrCancellation.cancel(); model.message = "正在取消外部 OCR；已完成页将保留为部分结果。" }
+        cancelAnnotation()
+        if let package = model.externalTranslation { cancelTranslation(operationID: model.translationOperationID, requestID: package.manifest.requestID) }
+    }
+
+    func cancelTranslation(operationID: UUID, requestID: String?) {
+        let identity = TranslationOperationIdentity(operationID: operationID, requestID: requestID)
+        guard identity.matches(operationID: model.translationOperationID, requestID: model.externalTranslation?.manifest.requestID) else { return }
+        // The local panel already stopped its own attempt; it has no external request to finish.
+        guard let package = model.externalTranslation, requestID == package.manifest.requestID else { return }
+        model.translationOperationID = UUID()
+        do { try finish(package, status: "cancelled", error: "userCancelled", provenance: [:]); model.externalTranslation = nil }
+        catch { model.fail(error) }
+    }
+
+    func cancelAnnotation(requestID: String? = nil) {
+        guard let package = model.externalAnnotation, requestID == nil || requestID == package.manifest.requestID else { return }
+        do { try finish(package, status: "cancelled", error: "userCancelled", provenance: [:]); model.externalAnnotation = nil }
+        catch { model.fail(error) }
     }
 
     private func outputURL(_ package: GaoValidatedPackage, name: String) throws -> URL {

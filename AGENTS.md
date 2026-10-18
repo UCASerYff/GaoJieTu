@@ -1,7 +1,9 @@
 # 搞截图
 
+- 用户2026-10-18偏好：默认不执行冒烟测试，不自动启动应用、浏览器或测试窗口。按改动需要可运行静态检查、编译及针对性单元测试。实际捕获、收音、系统授权与语言包下载由用户本人明确操作；报告须区分代码检查、用户反馈和实际输出证据。
+
 - 仅本目录与 /Applications/搞截图.app。Bundle ID com.gaoseries.GaoJieTu，初次 V1.00/build1，正式交付后每次 +0.01/build+1；同次未交付修复不增号。
-- 原生 SwiftUI/AppKit，macOS14+ Apple Silicon；麦克风与本机翻译需 macOS15+。没有真实 Developer ID 时本地签名并明确未公证。
+- 原生 SwiftUI/AppKit，macOS14+ Apple Silicon；SCK 麦克风伴录/组合与本机翻译需 macOS15+，独立麦克风录音 macOS14+。没有真实 Developer ID 时本地签名并明确未公证。
 - 真实资料 ~/Library/Application Support/GaoSeries/GaoJieTu，备份同级 GaoJieTu-Backups，钥匙串不迁移、不重置。首次不采集、不监听剪贴板、不保存历史。
 - Settings.json/History.json/Exchange 是版本化资料。损坏、过新、附件缺失、摘要冲突停止写入，不能空白覆盖。
 - Scripts/test.sh、build.sh、package.sh、install.sh 可复现。安装前完整备份、摘要核对、恢复演练；验证前保留旧程序，失败 rollback。仅按本App bundleID 精确登记和清理。
