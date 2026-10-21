@@ -10,3 +10,11 @@
 - 测试只用自建样本与隔离目录。TestResults、用户资料、备份、屏幕/声音实录不得进入 Git 或发行包。
 - GitHub UCASerYff/GaoJieTu 独立发布；只发布审核源码、原创资源、程序、源码包与 SHA256。无权或能力边界如实记录，不冒称完成。
 - GUI/权限/前台验收须与搞操作2、搞机灵协调；不得修改兄弟项目或卸载竞品。系统安全授权由用户本人确认。
+
+## 唯一搜索入口（用户 2026-10-21 明确要求）
+
+- 唯一正式入口为 `/Applications/搞截图.app`，Bundle ID `com.gaoseries.GaoJieTu`。收尾检查 Spotlight 与 LaunchServices，不能让 `.build/搞截图.app`、旧安装副本、备份中的 `Previous.app` / `PreviousInstalled.app` 或挂载镜像产生第二个“搞截图”。
+- 程序包与安装字节核验完成后清除展开的构建 App；GUI 验收暂缓不作为保留重复入口的理由。保留最新版发行包、源码、用户资料、验收证据与完整安全备份。
+- 本应用回滚备份使用不索引容器或验证过的压缩归档；现有 `Backup-*` 目录变更必须先核对 `Scripts/backup.py`、`install.sh`、`rollback.sh` 与 `TestResults/LatestInstallationBackup.txt`，再校验全部备份内容及恢复可用性，不能直接改变旧 `.app` 的结构。
+- 仅精确注销本 Bundle ID 的非正式路径，并复核只有正式路径保留；不使用全局清空登记/索引命令，不更改其他应用或用户系统隐私授权。
+- 仅修改本规则或其他文档时，不修改应用版本号、不重建或重新签名程序；若同步 GitHub，只更新文档提交，已发布程序仍对应其原始版本标签与源码提交。
