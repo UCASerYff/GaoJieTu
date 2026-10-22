@@ -412,7 +412,7 @@ if __name__ == '__main__':
     parser.add_argument('--destination', type=pathlib.Path)
     parser.add_argument('--allow-missing-root', action='store_true', help='明确接受自建隔离测试或首次安装尚未创建资料目录；已有安装禁止自动采用')
     args = parser.parse_args()
-    destination = args.destination or args.root.parent / 'GaoJieTu-Backups' / ('Backup-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
+    destination = args.destination or args.root.parent / 'GaoJieTu-Backups' / ('Backup-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8] + '.noindex')
     try:
         installed = pathlib.Path('/Applications/搞截图.app')
         # lexists preserves the difference between a missing installation and a broken installed link.

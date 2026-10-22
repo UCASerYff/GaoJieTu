@@ -7,7 +7,7 @@ if test -n "$(git status --porcelain --untracked-files=all)"; then echo '构建�
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resources/Info.plist)
 BUILD=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' Resources/Info.plist)
 mkdir -p Release
-ditto --norsrc --noextattr --noqtn -c -k --keepParent '.build/搞截图.app' "Release/GaoJieTu-V${VERSION}-build${BUILD}-macOS-arm64.zip"
+ditto --norsrc --noextattr --noqtn -c -k --keepParent '.build.noindex/搞截图.app' "Release/GaoJieTu-V${VERSION}-build${BUILD}-macOS-arm64.zip"
 git archive --format=zip -o "Release/GaoJieTu-V${VERSION}-Source.zip" HEAD
 shasum -a 256 "Release/GaoJieTu-V${VERSION}-build${BUILD}-macOS-arm64.zip" "Release/GaoJieTu-V${VERSION}-Source.zip" > Release/SHA256SUMS.txt
 python3 Scripts/verify_release.py --app-zip "Release/GaoJieTu-V${VERSION}-build${BUILD}-macOS-arm64.zip" --source-zip "Release/GaoJieTu-V${VERSION}-Source.zip" --checksums Release/SHA256SUMS.txt

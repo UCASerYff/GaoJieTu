@@ -409,7 +409,7 @@ class BackupTests(unittest.TestCase):
             (path / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'com.gaoseries.GaoJieTu',
                 'CFBundleShortVersionString': version, 'CFBundleVersion': build, 'CFBundleExecutable': 'GaoJieTu'}))
             (path / 'Contents/MacOS/GaoJieTu').write_bytes(('generated mock app ' + version).encode())
-        app(project / '.build/搞截图.app', '1.01', '2')
+        app(project / '.build.noindex/搞截图.app', '1.01', '2')
         if previous:
             app(target, '1.00', '1')
         program = pathlib.Path(__file__).with_name('install.sh').read_text().partition("<<'PY'\n")[2].rsplit('\nPY\n', 1)[0]
@@ -428,7 +428,7 @@ class BackupTests(unittest.TestCase):
                 code = 1
             elif args[0] == '/usr/bin/ditto':
                 shutil.copytree(args[1], args[2], dirs_exist_ok=True)
-                if stage_wrong_bundle and pathlib.Path(args[2]).name.startswith('.GaoJieTu-stage-'):
+                if stage_wrong_bundle and pathlib.Path(args[2]).parent.name.startswith('.GaoJieTu-stage-'):
                     path = pathlib.Path(args[2]) / 'Contents/Info.plist'
                     info = plistlib.loads(path.read_bytes())
                     info['CFBundleIdentifier'] = 'org.other.App'
@@ -449,6 +449,7 @@ class BackupTests(unittest.TestCase):
         self.execute_isolated_install(program, target=target)
         self.assertEqual(plistlib.loads((target / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString'], '1.01')
         backup = pathlib.Path((project / 'TestResults/LatestInstallationBackup.txt').read_text().strip())
+        self.assertTrue(backup.name.endswith('.noindex'))
         receipt = json.loads((backup / 'Installation.json').read_text())
         self.assertIs(receipt['hadPreviousApp'], True)
         self.assertTrue((backup / 'Previous.app').exists() and (backup / 'PreviousInstalled.app').exists())
@@ -456,6 +457,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(before, backup_module.inventory(self.root))
         self.assertFalse((target.parent / '.GaoJieTu-install.lock').exists())
         self.assertFalse(list((project / 'TestResults').glob('*.tmp')))
+        self.assertFalse(list(target.parent.glob('.GaoJieTu-stage-*')))
 
     def test_first_install_preserves_other_apps(self):
         program, target, project = self.prepare_install(previous=False)
@@ -476,7 +478,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(plistlib.loads((target / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString'], '1.00')
         self.assertEqual(before, backup_module.inventory(self.root))
         self.assertFalse((project / 'TestResults/LatestInstallationBackup.txt').exists())
-        self.assertFalse(list(target.parent.glob('.GaoJieTu-stage-*.app')))
+        self.assertFalse(list(target.parent.glob('.GaoJieTu-stage-*')))
 
     def test_signature_failure_after_install_archives_new_and_restores_old(self):
         program, target, project = self.prepare_install()

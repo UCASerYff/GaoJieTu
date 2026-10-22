@@ -53,4 +53,10 @@ class ReleaseTests(unittest.TestCase):
  def test_unrelated_archive_file(self):
   with zipfile.ZipFile(self.appzip,'a') as z:z.writestr('unrelated.txt','fixture')
   with self.assertRaisesRegex(RuntimeError,'unrelated files'):self.verify()
+ def test_tracked_noindex_build_artifact_rejected(self):
+  name='.build.noindex/compiled-app.bin';data=b'SYNTHETIC BUILD ARTIFACT';self.source[name]=data
+  p=self.root/name;p.parent.mkdir(parents=True);p.write_bytes(data)
+  subprocess.run(['git','add',name],check=True);subprocess.run(['git','-c','user.name=Synthetic','-c','user.email=test@example.invalid','commit','-qm','synthetic build artifact'],check=True)
+  self.commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip();self.write()
+  with self.assertRaisesRegex(RuntimeError,'private/build data'):self.verify()
 if __name__=='__main__':unittest.main(verbosity=2)

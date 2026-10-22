@@ -37,7 +37,7 @@ def verify(app_zip, source_zip, checksum_file, commit, installed=None):
         expected[name.decode()] = object_hash
     require(set(source) == set(expected), 'source archive is not the complete selected commit')
     for name, data in source.items():
-        require(name.split('/')[0] not in {'.git', '.build', 'TestResults', 'Release', 'Backups', 'private'}, 'private/build data in source archive')
+        require(name.split('/')[0] not in {'.git', '.build', '.build.noindex', 'TestResults', 'Release', 'Backups', 'private'}, 'private/build data in source archive')
         blob = subprocess.check_output(['git', 'cat-file', 'blob', expected[name]])
         require(data == blob, 'source bytes differ from selected commit: ' + name)
     packaged = archive(app_zip)

@@ -76,6 +76,7 @@ private struct SystemTranslationPanel: View {
     @State private var pairStatus: LanguageAvailability.Status?
     @State private var configuration: TranslationSession.Configuration?
     @State private var translated = ""
+    @State private var detectedSourceLanguage: String?
     @State private var errorMessage: String?
     @State private var isRunning = false
     @State private var attempt: TranslationAttempt?
@@ -103,6 +104,7 @@ private struct SystemTranslationPanel: View {
                 Spacer()
             }
             if let errorMessage { Text(errorMessage).foregroundStyle(.red).textSelection(.enabled) }
+            if let detectedSourceLanguage { Text("系统识别原文语言：\(languageName(detectedSourceLanguage))").font(.caption) }
             if !translated.isEmpty { Text("译文").font(.headline); ScrollView { Text(translated).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }.frame(minHeight: 100) }
         }
         .padding(20).frame(minWidth: 500, minHeight: 420)
@@ -120,15 +122,13 @@ private struct SystemTranslationPanel: View {
             guard let snapshot = attempt else { return }
             currentSession = session
             do {
-                try Task.checkCancellation()
-                try await session.prepareTranslation()
-                try Task.checkCancellation()
-                guard attempt?.id == snapshot.id else { return }
-                let response = try await session.translate(snapshot.text)
-                try Task.checkCancellation()
-                guard attempt?.id == snapshot.id else { return }
+                let response = try await TranslationExecution.run(attempt: snapshot,
+                    isCurrent: { attempt?.id == snapshot.id && identity == snapshot.identity },
+                    prepare: { try await session.prepareTranslation() },
+                    translate: { try await session.translate($0) })
                 var result = LocalTranslationResult(sourceText: response.sourceText, translatedText: response.targetText, sourceLanguage: response.sourceLanguage.minimalIdentifier, targetLanguage: response.targetLanguage.minimalIdentifier)
                 result.languagePackageDownloadRequested = snapshot.packageDownloadRequested
+                detectedSourceLanguage = snapshot.sourceLanguage == "auto" ? result.sourceLanguage : nil
                 translated = result.translatedText; isRunning = false
                 onCompletion(result, snapshot.identity.operationID, snapshot.identity.requestID)
                 await refreshAvailability()
@@ -164,13 +164,13 @@ private struct SystemTranslationPanel: View {
     private func begin() {
         guard text.count <= 100_000 else { errorMessage = LocalTranslationError.tooLong.localizedDescription; return }
         guard pairStatus == .installed || pairStatus == .supported, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        errorMessage = nil; translated = ""; isRunning = true
+        errorMessage = nil; translated = ""; detectedSourceLanguage = nil; isRunning = true
         attempt = TranslationAttempt(identity: identity, text: text, sourceLanguage: source, targetLanguage: target, packageDownloadRequested: pairStatus == .supported)
         let new = TranslationSession.Configuration(source: source == "auto" ? nil : Locale.Language(identifier: source), target: Locale.Language(identifier: target))
         if configuration?.source == new.source && configuration?.target == new.target { configuration?.invalidate() } else { configuration = new }
     }
     private func inputChanged() {
-        pairStatus = nil; translated = ""; availabilityText = "正在检查语言组合…"
+        pairStatus = nil; translated = ""; detectedSourceLanguage = nil; availabilityText = "正在检查语言组合…"
         Task { await refreshAvailability() }
     }
     private func cancel(notify: Bool) {

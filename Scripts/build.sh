@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-mkdir -p .build /private/tmp/GaoJieTuModuleCache
-BUILD_STAGE=$(mktemp -d "$PWD/.build/GaoJieTu-build.XXXXXX")
+mkdir -p .build.noindex /private/tmp/GaoJieTuModuleCache
+BUILD_STAGE=$(mktemp -d "$PWD/.build.noindex/GaoJieTu-build.XXXXXX")
 trap 'rm -rf "$BUILD_STAGE"' EXIT
 APP="$BUILD_STAGE/搞截图.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -25,7 +25,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(value,indent=2)+'\n')
 PY
 codesign --force --sign - --identifier com.gaoseries.GaoJieTu "$APP"
 codesign --verify --deep --strict "$APP"
-DESTINATION="$PWD/.build/搞截图.app"
+DESTINATION="$PWD/.build.noindex/搞截图.app"
 if [[ -L "$DESTINATION" ]]; then echo '构建目标为链接，停止替换。' >&2; exit 1; fi
 rm -rf "$DESTINATION"
 mv "$APP" "$DESTINATION"

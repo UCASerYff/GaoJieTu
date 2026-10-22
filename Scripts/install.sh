@@ -23,7 +23,7 @@ spec = importlib.util.spec_from_file_location('gao_backup', project / 'Scripts/b
 safety = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(safety)
 BUNDLE_ID = 'com.gaoseries.GaoJieTu'
-SOURCE = project / '.build/搞截图.app'
+SOURCE = project / '.build.noindex/搞截图.app'
 TARGET = pathlib.Path('/Applications/搞截图.app')
 DATA = pathlib.Path.home() / 'Library/Application Support/GaoSeries/GaoJieTu'
 BACKUP_ROOT = DATA.parent / 'GaoJieTu-Backups'
@@ -164,6 +164,7 @@ def update_pointer(backup):
 
 lock = AppMutationLock()
 stage = None
+stage_container = None
 stage_owned = False
 backup = None
 old_moved = False
@@ -176,7 +177,7 @@ try:
     previous_identity = strict_stat(TARGET)
     had_previous = previous_identity is not None
     previous_info = verify_bundle(TARGET) if had_previous else None
-    backup = BACKUP_ROOT / ('Backup-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
+    backup = BACKUP_ROOT / ('Backup-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8] + '.noindex')
     safety.backup(DATA, backup, allow_missing=not had_previous)
     write_new_json(backup / 'Installation.json', {'schemaVersion': 1, 'bundleID': BUNDLE_ID, 'targetPath': str(TARGET),
         'hadPreviousApp': had_previous, 'createdAt': utc_now(),
@@ -186,7 +187,9 @@ try:
     if had_previous:
         subprocess.run(['/usr/bin/ditto', str(TARGET), str(backup / 'Previous.app')], check=True, capture_output=True)
         require(bundle_version(verify_bundle(backup / 'Previous.app')) == bundle_version(previous_info), '旧程序备份身份或版本核对失败')
-    stage = TARGET.parent / ('.GaoJieTu-stage-' + uuid.uuid4().hex + '.app')
+    stage_container = TARGET.parent / ('.GaoJieTu-stage-' + uuid.uuid4().hex + '.noindex')
+    os.mkdir(stage_container, 0o700)
+    stage = stage_container / '搞截图.app'
     os.mkdir(stage, 0o700)
     stage_owned = True
     subprocess.run(['/usr/bin/ditto', str(SOURCE), str(stage)], check=True, capture_output=True)
@@ -241,6 +244,13 @@ finally:
         entry = strict_stat(stage)
         if entry is not None and stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode) and entry.st_uid == os.getuid():
             shutil.rmtree(stage)
+    if stage_container is not None:
+        entry = strict_stat(stage_container)
+        if entry is not None and stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode) and entry.st_uid == os.getuid():
+            try:
+                stage_container.rmdir()
+            except OSError:
+                print('非空安装暂存容器已保留待核验：' + str(stage_container), file=sys.stderr)
     try:
         lock.release()
     except (OSError, ValueError, RuntimeError) as error:
