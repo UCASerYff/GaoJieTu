@@ -270,7 +270,9 @@ enum GaoActionWriter {
                 let filename = String(UUID().uuidString.prefix(8)) + "-" + GaoActionContract.safeFilename(file.url.lastPathComponent)
                 let copied = try GaoPrivateIO.copy(fd,to:payload,name:filename,maximum:GaoActionContract.maximumPayloadBytes-total)
                 total += copied.0
-                manifest.items.append(GaoActionItem(id:file.id,relativePath:filename,uti:file.uti,byteCount:copied.0,sha256:copied.1))
+                // Research's receiver requires package-relative paths; existing peers use payload-relative names.
+                let relativePath = manifest.targetBundleID == "com.academic-achievement.manager" ? "payload/" + filename : filename
+                manifest.items.append(GaoActionItem(id:file.id,relativePath:relativePath,uti:file.uti,byteCount:copied.0,sha256:copied.1))
             }
             try GaoActionContract.validate(manifest,expectedTargetBundleID:manifest.targetBundleID,now:now)
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys,.withoutEscapingSlashes]

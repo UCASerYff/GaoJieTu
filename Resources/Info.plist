@@ -4,7 +4,7 @@
 <key>CFBundleIdentifier</key><string>com.gaoseries.GaoJieTu</string>
 <key>CFBundleName</key><string>搞截图</string><key>CFBundleDisplayName</key><string>搞截图</string>
 <key>CFBundleExecutable</key><string>GaoJieTu</string><key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.03</string><key>CFBundleVersion</key><string>4</string>
+<key>CFBundleShortVersionString</key><string>1.04</string><key>CFBundleVersion</key><string>5</string>
 <key>CFBundleIconFile</key><string>AppIcon</string><key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/><key>NSSupportsAutomaticTermination</key><false/>
 <key>NSMicrophoneUsageDescription</key><string>仅在你明确开始麦克风录音或录屏时采集声音。</string>

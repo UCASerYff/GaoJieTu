@@ -169,6 +169,9 @@ enum GaoActionContract {
         let components = path.split(separator:"/",omittingEmptySubsequences:false).map(String.init)
         guard !components.contains(where:{ $0.isEmpty || $0 == "." || $0 == ".." }) else { throw reject("invalidPath","交接附件路径不安全。") }
         guard !components.isEmpty else { throw reject("invalidPath","交接附件不是普通文件。") }
+        // V1 peers use either payload-relative names or package-relative payload/<name>.
+        // Consume exactly one optional directory prefix; inner directories retain their identity.
+        if components.count > 1, components.first == "payload" { return Array(components.dropFirst()) }
         return components
     }
     static func localFileURL(_ string: String) throws -> URL {

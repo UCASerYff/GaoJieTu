@@ -1,8 +1,14 @@
 # 搞截图
 
-原生 macOS 截图、标注、贴图、录屏/独立录音、GIF、本机 OCR 与翻译工作台。Bundle ID `com.gaoseries.GaoJieTu`，V1.03 / build 4，Apple Silicon，macOS 14+。不采集遥测，不默认保存截图历史，不监听剪贴板或全局划词。
+原生 macOS 截图、标注、贴图、录屏/独立录音、GIF、本机 OCR 与翻译工作台。Bundle ID `com.gaoseries.GaoJieTu`，V1.04 / build 5，Apple Silicon，macOS 14+。不采集遥测，不默认保存截图历史，不监听剪贴板或全局划词。
 
-当前为 V1.03 验收候选。针对性回归、文件级安装核验与实际操作验收分别记录；编译或生成媒体通过不能替代真实屏幕、声音和系统权限结果。系统授权、采集与语言包下载按用户明确授权操作；实际验收前保留旧程序与回滚材料，正式稳定 Release 在验收通过后发布。
+当前为 V1.04 验收候选。针对性回归、文件级安装核验与实际操作验收分别记录；编译或生成媒体通过不能替代真实屏幕、声音和系统权限结果。系统授权、采集与语言包下载按用户明确授权操作；实际验收前保留旧程序与回滚材料，正式稳定 Release 在验收通过后发布。
+
+## V1.04 修正
+
+- 修复搞研究公开图片 OCR 交接的附件路径：接收端严格校验原始路径组件后，兼容 `文件名` 与 `payload/文件名` 两种 V1 写法，只消耗一次可选前缀；内层同名目录照实定位，不回退尝试其他路径。两种写法指向同一附件时按归一后路径拒绝重复。
+- 回给 `com.academic-achievement.manager` 的附件使用其接收器要求的 `payload/文件名`；其他目标保持原有写法。固定 FD、no-follow、文件身份、大小、摘要及 TTL 校验保留，旧请求不修改、不重放。
+- 本轮仅处理搞研究 PNG 文件 OCR 的往返依赖。隔离协议检查使用双方真实编解码，不执行 OCR；实机 OCR、安装来源与发行下载的结果分别记录在 Release 说明。屏幕、声音和其他功能不因本修复视为通过。
 
 ## V1.03 修正
 
@@ -43,6 +49,7 @@ V1.01 已安装并预发布后，在实际窗口验收中发现 Dock 的透明�
 ```sh
 Scripts/test-actions.sh         # 翻译取消身份、混合PDF与OCR恢复的针对性回归，无GUI
 Scripts/test-translation.sh     # 自动翻译调用顺序、取消与请求隔离，无GUI/下载
+Scripts/test-exchange.sh        # 路径安全回归及研究真实编解码往返，无GUI/OCR；需兄弟研究源码，可显式选择 --without-research
 python3 Scripts/test_release.py # 发行来源、版本、摘要与安装字节核验的合成测试
 python3 Scripts/test_backup.py  # 备份/回滚边界测试，不操作真实安装
 # Scripts/test.sh 为完整旧回归，含窗口测试；按需明确选择，不默认执行
@@ -59,7 +66,7 @@ Scripts/rollback.sh             # 恢复旧程序；用户资料保持
 
 资源 `GaoCapabilities.json` 声明七项提供方能力：`capture.region/window/display`、`ocr.files`、`images.annotate`、`images.pin`、`text.translate`，参数严格按任务契约。外部包验证版本、目标、TTL、大小、FD路径与摘要，复制至私有 staging，用户确认后启动。结果在实际动作后生成，用户点“发送结果”才显式交给来源 App；仅打开标注/翻译页面返回 pending。重复请求与重启不重放业务。
 
-`relativePath` 相对于包内 `payload/` 目录，不带该目录前缀。结果 `parameters={}`；成功 `errorCode` 可省略。OCR逐输入/输出关联 `sourceItemID/sourceSHA256/resultItemID`；翻译使用 `networkUsed`。本地 fixture 与双方真实编解码通过不等于已安装双方端到端验收。
+接收端的 `relativePath` 兼容包内 `payload/` 目录相对路径与包根相对的 `payload/文件名`，严格检查后仅剥离一次可选首段 `payload`。嵌套目录保持原意，规范化后的同一路径不可重复。发给搞研究的附件带 `payload/` 前缀，其他目标保持原有目录相对写法。结果 `parameters={}`；成功 `errorCode` 可省略。OCR逐输入/输出关联 `sourceItemID/sourceSHA256/resultItemID`；翻译使用 `networkUsed`。本地 fixture 与双方真实编解码通过不等于已安装双方端到端验收。
 
 ## 验证状态与边界
 

@@ -56,6 +56,37 @@ enum GaoActionTests {
             let url = root.appendingPathComponent(UUID().uuidString+".gaoaction")
             try GaoActionFixtures.write(manifest:manifest,payload:["input.txt":bytes],to:url); return url
         }
+        var prefixed = base; prefixed.items[0].relativePath = "payload/input.txt"
+        let prefixedInput = try package(prefixed)
+        try check(try Data(contentsOf:receive(prefixedInput).stagedItems[0].url) == GaoActionFixtures.hello,"package-relative payload prefix reads exact bytes")
+        var duplicatePaths = base
+        var alias = base.items[0]; alias.id = "same-file-alias"; alias.relativePath = "payload/input.txt"
+        duplicatePaths.items.append(alias)
+        let aliases = try package(duplicatePaths)
+        try rejects("duplicatePath") { _ = try receive(aliases) }
+        // A real inner folder named payload is valid. Never strip twice or retry a different path.
+        var nested = base; nested.items[0].relativePath = "payload/payload/input.txt"
+        let innerBytes = Data("inner\n".utf8); nested.items[0].sha256 = FileSafety.digest(innerBytes)
+        let nestedInput = try package(nested)
+        try rejects { _ = try receive(nestedInput) }
+        let innerDirectory = nestedInput.appendingPathComponent("payload/payload")
+        try fm.createDirectory(at:innerDirectory,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700])
+        let innerFile = innerDirectory.appendingPathComponent("input.txt")
+        try innerBytes.write(to:innerFile); try fm.setAttributes([.posixPermissions:0o600],ofItemAtPath:innerFile.path)
+        try check(try Data(contentsOf:receive(nestedInput).stagedItems[0].url) == innerBytes,"consume one prefix and retain real nested payload directory")
+        for path in ["payload/./input.txt","payload/../input.txt","payload//input.txt","payload/","payload\\input.txt","payload/\0input.txt"] {
+            var invalid = base; invalid.items[0].relativePath = path
+            let input = try package(invalid)
+            try rejects("invalidPath") { _ = try receive(input) }
+        }
+        var nonFile = base; nonFile.items[0].relativePath = "payload/folder"
+        let directoryInput = try package(nonFile)
+        try fm.createDirectory(at:directoryInput.appendingPathComponent("payload/folder"),withIntermediateDirectories:false,attributes:[.posixPermissions:0o700])
+        try rejects("unsafeFile") { _ = try receive(directoryInput) }
+        var linkedDirectory = base; linkedDirectory.items[0].relativePath = "payload/linked/input.txt"
+        let linkedInput = try package(linkedDirectory)
+        try fm.createSymbolicLink(at:linkedInput.appendingPathComponent("payload/linked"),withDestinationURL:linkedInput.appendingPathComponent("payload"))
+        try rejects { _ = try receive(linkedInput) }
         var m = base; m.targetBundleID = "com.gaoseries.Other"
         let wrongTarget = try package(m); try rejects("wrongTarget") { _ = try receive(wrongTarget) }
         m = base; m.parameters["shell"] = .string("arbitrary")
@@ -124,6 +155,12 @@ enum GaoActionTests {
         try check(!generated.manifest.items[0].relativePath.hasPrefix("payload/"),"writer paths relative to payload directory")
         try check(Data(base64Encoded:generated.manifest.nonce) != Data(repeating:0,count:32),"production nonce uses real randomness")
         try check(try Data(contentsOf:external) == GaoActionFixtures.hello,"writer leaves original in place unchanged")
+        var researchRequest = generated.manifest; researchRequest.sourceBundleID = "com.academic-achievement.manager"
+        let researchResult = try GaoActionWriter.writeResult(inReplyTo:researchRequest,status:"completed",items:[GaoOutgoingFile(url:external,uti:"text/plain")],provenance:[:],exchangeRoot:privateExchange,now:GaoActionFixtures.clock)
+        let researchManifest = try GaoActionTransport.decodeManifest(Data(contentsOf:researchResult.appendingPathComponent("manifest.json")))
+        try check(researchManifest.items[0].relativePath.hasPrefix("payload/"),"Research target uses package-relative payload prefix")
+        let researchReceived = try GaoActionTransport.receive(packageURL:researchResult,exchangeRoot:exchange,expectedTargetBundleID:researchRequest.sourceBundleID,now:GaoActionFixtures.clock)
+        try check(try Data(contentsOf:researchReceived.stagedItems[0].url) == GaoActionFixtures.hello,"Research-prefixed writer roundtrip preserves bytes")
         let result = try GaoActionWriter.writeResult(inReplyTo:generated.manifest,status:"completed",provenance:["workflowState":.string("opened")],exchangeRoot:privateExchange,now:GaoActionFixtures.clock)
         try check(try GaoActionTransport.decodeManifest(Data(contentsOf:result.appendingPathComponent("manifest.json"))).parameters.isEmpty,"result parameters empty")
         let validatedResult = try GaoActionTransport.receive(packageURL:result,exchangeRoot:exchange,expectedTargetBundleID:"com.gaoseries.FixtureSender",now:GaoActionFixtures.clock)
