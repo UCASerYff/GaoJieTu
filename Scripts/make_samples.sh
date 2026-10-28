@@ -1,9 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-mkdir -p TestResults/Acceptance /private/tmp/GaoJieTuModuleCache
-xcrun swift -module-cache-path /private/tmp/GaoJieTuModuleCache Scripts/MakeAcceptanceSamples.swift
-SAMPLE_APP="TestResults/Acceptance/AcceptanceSample.app"
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "--helper-only" ) ]]; then
+    echo '用法：Scripts/make_samples.sh [--helper-only]' >&2
+    exit 2
+fi
+mkdir -p TestResults/Acceptance/Helpers.noindex /private/tmp/GaoJieTuModuleCache
+if [[ $# -eq 0 ]]; then
+    xcrun swift -module-cache-path /private/tmp/GaoJieTuModuleCache Scripts/MakeAcceptanceSamples.swift
+fi
+SAMPLE_APP="TestResults/Acceptance/Helpers.noindex/AcceptanceSample.app"
 mkdir -p "$SAMPLE_APP/Contents/MacOS"
 xcrun swiftc -parse-as-library -swift-version 5 -target arm64-apple-macos14.0 -module-cache-path /private/tmp/GaoJieTuModuleCache Scripts/AcceptanceSampleHost.swift -o "$SAMPLE_APP/Contents/MacOS/AcceptanceSample"
 cat > "$SAMPLE_APP/Contents/Info.plist" <<'PLIST'

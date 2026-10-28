@@ -5,6 +5,50 @@ enum PinnedImageGeometry {
     static func actualPixelScale(backingScale: CGFloat) -> CGFloat {
         backingScale.isFinite && backingScale > 0 ? 1 / backingScale : 1
     }
+
+    /// The interactive canvas may be larger than a tiny image; the image itself is never stretched.
+    static func windowSize(pixelSize: CGSize, scale: CGFloat, minimumSide: CGFloat = 24) -> CGSize {
+        CGSize(width: max(minimumSide, pixelSize.width * scale), height: max(minimumSide, pixelSize.height * scale))
+    }
+
+    static func imageRect(pixelSize: CGSize, scale: CGFloat, in bounds: CGRect) -> CGRect {
+        let size = CGSize(width: pixelSize.width * scale, height: pixelSize.height * scale)
+        return CGRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2, width: size.width, height: size.height)
+    }
+
+    /// A missing/off-screen saved position must still receive a canvas sized for the restored scale.
+    static func restoredFrame(pixelSize: CGSize, scale: CGFloat, savedFrame: CGRect, fallbackFrame: CGRect, visibleFrames: [CGRect]) -> CGRect {
+        func usable(_ rect: CGRect) -> Bool {
+            rect.minX.isFinite && rect.minY.isFinite && rect.maxX.isFinite && rect.maxY.isFinite && rect.width > 0 && rect.height > 0
+        }
+        let required = windowSize(pixelSize: pixelSize, scale: scale)
+        let screens = visibleFrames.filter(usable)
+        if usable(savedFrame), let screen = screens.first(where: { $0.intersects(savedFrame) }) {
+            let size = CGSize(width: max(savedFrame.width, required.width), height: max(savedFrame.height, required.height))
+            if size == savedFrame.size { return savedFrame }
+            return positioned(size: size, near: savedFrame.origin, in: screen)
+        }
+        let fallback = usable(fallbackFrame) ? fallbackFrame : CGRect(origin: .zero, size: required)
+        guard let screen = screens.first(where: { $0.intersects(fallback) }) ?? screens.first else {
+            return CGRect(origin: fallback.origin, size: required)
+        }
+        return positioned(size: required, near: fallback.origin, in: screen)
+    }
+
+    private static func positioned(size: CGSize, near origin: CGPoint, in screen: CGRect) -> CGRect {
+        let x = min(max(origin.x, screen.minX), max(screen.minX, screen.maxX - size.width))
+        let y = min(max(origin.y, screen.minY), max(screen.minY, screen.maxY - size.height))
+        return CGRect(x: x, y: y, width: size.width, height: size.height)
+    }
+}
+
+enum PinnedImageRestorePlan {
+    /// Only persistent identities participate. Ordinary user-created copies remain independent.
+    static func missing(records: [PinnedImageRecord], activePersistentPaths: [String]) -> [PinnedImageRecord] {
+        func identity(_ path: String) -> String { URL(fileURLWithPath: path).standardizedFileURL.path }
+        var seen = Set(activePersistentPaths.map(identity))
+        return records.filter { seen.insert(identity($0.imagePath)).inserted }
+    }
 }
 
 @MainActor
@@ -50,7 +94,8 @@ final class PinnedImageController: NSObject {
     func restorePersistentPins(onEdit: ((CGImage) -> Void)? = nil) {
         let records: [PinnedImageRecord]
         do { records = try self.records() } catch { onNotice?(error.localizedDescription); return }
-        for record in records {
+        let missing = PinnedImageRestorePlan.missing(records: records, activePersistentPaths: pins.values.compactMap(\.persistentImagePath))
+        for record in missing {
             let url = URL(fileURLWithPath: record.imagePath)
             guard let root = persistenceDirectory, url.deletingLastPathComponent().standardizedFileURL == root.appendingPathComponent("Pins", isDirectory: true).standardizedFileURL else {
                 onNotice?("持久贴图路径不在本App明确保存目录内，已停止该项恢复。"); continue
@@ -165,13 +210,18 @@ private final class PinnedImageWindow: NSWindowController, NSWindowDelegate {
     var onNotice: ((String) -> Void)?
     private var imageScale: CGFloat = 1
     private var explicitlyRemembered = false
+    fileprivate var persistentImagePath: String? { explicitlyRemembered ? sourceURL?.path : nil }
+
+    fileprivate func imageRect(in bounds: CGRect) -> CGRect {
+        PinnedImageGeometry.imageRect(pixelSize: CGSize(width: image.width, height: image.height), scale: imageScale, in: bounds)
+    }
 
     init(id: UUID, image: CGImage, sourceURL: URL?) {
         self.pinID = id; self.image = image; self.sourceURL = sourceURL
         let screenScale = NSScreen.main?.backingScaleFactor ?? 1
         let scale = min(1 / screenScale, 600 / CGFloat(max(image.width, image.height)))
         imageScale = max(0.001, scale)
-        let rect = CGRect(x: 80, y: 100, width: CGFloat(image.width) * imageScale, height: CGFloat(image.height) * imageScale)
+        let rect = CGRect(origin: CGPoint(x: 80, y: 100), size: PinnedImageGeometry.windowSize(pixelSize: CGSize(width: image.width, height: image.height), scale: imageScale))
         let panel = PinPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true
         panel.isReleasedWhenClosed = false; panel.isMovableByWindowBackground = true
@@ -188,15 +238,15 @@ private final class PinnedImageWindow: NSWindowController, NSWindowDelegate {
 
     func restore(_ record: PinnedImageRecord) {
         guard record.imageScale.isFinite, (0.001...8).contains(record.imageScale), record.opacity.isFinite, (0.15...1).contains(record.opacity) else { return }
-        imageScale = record.imageScale; explicitlyRemembered = true
-        let frame = NSRectFromString(record.windowFrame)
-        if frame.width.isFinite, frame.height.isFinite, frame.minX.isFinite, frame.minY.isFinite,
-           frame.width > 0, frame.height > 0, NSScreen.screens.contains(where: { $0.visibleFrame.intersects(frame) }) {
-            window?.setFrame(frame, display: true)
-        }
+        imageScale = record.imageScale; explicitlyRemembered = false
+        let frame = PinnedImageGeometry.restoredFrame(pixelSize: CGSize(width: image.width, height: image.height), scale: imageScale,
+                                                     savedFrame: NSRectFromString(record.windowFrame), fallbackFrame: window?.frame ?? .zero,
+                                                     visibleFrames: NSScreen.screens.map(\.visibleFrame))
+        window?.setFrame(frame, display: true)
         window?.alphaValue = record.opacity
         // Pass-through and topmost safety state are not persisted; restored pins always remain operable.
         window?.ignoresMouseEvents = false
+        explicitlyRemembered = true
     }
 
     func markRemembered(url: URL) throws {
@@ -213,7 +263,7 @@ private final class PinnedImageWindow: NSWindowController, NSWindowDelegate {
     func zoom(by factor: CGFloat) {
         guard let window, factor.isFinite, factor > 0 else { return }
         imageScale = min(8, max(0.001, imageScale * factor))
-        let size = CGSize(width: max(24, CGFloat(image.width) * imageScale), height: max(24, CGFloat(image.height) * imageScale))
+        let size = PinnedImageGeometry.windowSize(pixelSize: CGSize(width: image.width, height: image.height), scale: imageScale)
         let center = CGPoint(x: window.frame.midX, y: window.frame.midY)
         window.setFrame(CGRect(x: center.x - size.width / 2, y: center.y - size.height / 2, width: size.width, height: size.height), display: true)
         savePositionIfRemembered()
@@ -285,7 +335,8 @@ private final class PinImageView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func draw(_ dirtyRect: NSRect) {
         guard let image else { return }
-        NSGraphicsContext.current?.cgContext.draw(image, in: bounds)
+        NSGraphicsContext.current?.cgContext.clear(bounds)
+        NSGraphicsContext.current?.cgContext.draw(image, in: pin?.imageRect(in: bounds) ?? bounds)
     }
     override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
     override func rightMouseDown(with event: NSEvent) { if let menu = pin?.menu() { NSMenu.popUpContextMenu(menu, with: event, for: self) } }

@@ -5,7 +5,7 @@ import Combine
 import CoreAudio
 
 @MainActor
-final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDelegate {
+final class RecordingController: NSObject, ObservableObject {
     @Published private(set) var state: RecordingState = .idle
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var statusMessage = "录制仅在你点击开始后进行"
@@ -18,6 +18,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
     private var pipeline: RecordingPipeline?
     private var stream: SCStream?
     private var audioRecorder: AVAudioRecorder?
+    private var recorderDelegate: RecordingRecorderDelegate?
     private var filePlan: RecordingFilePlan?
     private var activeConfiguration: RecordingConfiguration?
     private var timer: Timer?
@@ -25,6 +26,8 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
     private var selectedMicrophoneID: String?
     private var outputRoute: RecordingOutputRouteGuard?
     private var startedAt: Date?
+    private var activeSessionID: UUID?
+    private var sourceRefreshID = UUID()
 
     var isActive: Bool { [.preparing, .recording, .paused, .stopping].contains(state) }
 
@@ -34,6 +37,9 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
     }
 
     func refreshSources() async {
+        guard !isActive else { return }
+        let refreshID = UUID()
+        sourceRefreshID = refreshID
         guard CGPreflightScreenCaptureAccess() else {
             statusMessage = "列出屏幕和窗口需要屏幕录制权限；仅麦克风录音不需要此权限"
             sources = []
@@ -41,6 +47,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard sourceRefreshID == refreshID, !isActive, !Task.isCancelled else { return }
             var options = content.displays.map { RecordingSource(kind: .display, displayID: $0.displayID,
                 name: "屏幕 \($0.displayID)（\($0.width) × \($0.height)）") }
             options += content.windows.filter { $0.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier && $0.frame.width > 1 && $0.frame.height > 1 }
@@ -48,11 +55,18 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
                     name: "\($0.owningApplication?.applicationName ?? "窗口") — \($0.title ?? "未命名窗口")") }
             sources = options
             statusMessage = "已读取可捕获源；受保护内容可能拒绝输出"
-        } catch { statusMessage = error.localizedDescription }
+        } catch {
+            guard sourceRefreshID == refreshID, !isActive, !Task.isCancelled else { return }
+            statusMessage = error.localizedDescription
+        }
     }
 
     func start(configuration: RecordingConfiguration) async {
         guard state == .idle || state == .failed else { return }
+        let sessionID = UUID()
+        activeSessionID = sessionID
+        sourceRefreshID = UUID()
+        activeConfiguration = nil; filePlan = nil; startedAt = nil
         do {
             try configuration.validate()
             if configuration.needsScreenPermission && !CGPreflightScreenCaptureAccess() {
@@ -68,7 +82,8 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
                 guard #available(macOS 15.0, *) else { throw RecordingError.unsupported("原生鼠标点击高亮需要 macOS 15") }
             }
             try changeState(.preparing)
-            elapsed = 0; metrics = RecordingMetrics(); lastOutputURL = nil
+            elapsed = 0; metrics = RecordingMetrics(); lastOutputURL = nil; startedAt = nil
+            filePlan = nil; recoveryURL = nil
             activeConfiguration = configuration
             outputRoute = nil
             if configuration.systemAudio {
@@ -86,17 +101,22 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
                 let recorder = try AVAudioRecorder(url: plan.partialURL, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 96_000,
                     AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue])
-                recorder.delegate = self
+                let failureHandler = makeFailureHandler(for: sessionID)
+                let delegate = RecordingRecorderDelegate { error in _ = failureHandler(error) }
+                recorderDelegate = delegate
+                recorder.delegate = delegate
                 recorder.isMeteringEnabled = true
                 audioRecorder = recorder
                 try writeMicrophoneJournal(state: .preparing)
                 guard recorder.prepareToRecord(), recorder.record() else { throw RecordingError.writing("麦克风录音器无法启动") }
                 try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: plan.partialURL.path)
             } else {
-                let (filter, captureConfiguration) = try await makeCapture(configuration)
+                let (filter, captureConfiguration) = try await makeCapture(configuration, sessionID: sessionID)
+                try requireSession(sessionID, in: [.preparing])
                 let writer = try RecordingPipeline(configuration: configuration, plan: plan,
                     width: captureConfiguration.width, height: captureConfiguration.height)
-                writer.onFailure = { [weak self] error in Task { @MainActor in await self?.stop(failure: error) } }
+                let failureHandler = makeFailureHandler(for: sessionID)
+                writer.onFailure = { error in _ = failureHandler(error) }
                 pipeline = writer
                 let stream = SCStream(filter: filter, configuration: captureConfiguration, delegate: writer)
                 self.stream = stream
@@ -106,21 +126,40 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
                     if #available(macOS 15.0, *) { try stream.addStreamOutput(writer, type: .microphone, sampleHandlerQueue: writer.queue) }
                 }
                 try await stream.startCapture()
+                guard isCurrentSession(sessionID, in: [.preparing]) else {
+                    // This is the local old stream, never whichever stream a new session owns.
+                    try? await stream.stopCapture()
+                    return
+                }
             }
+            try requireSession(sessionID, in: [.preparing])
             startedAt = Date()
             try changeState(.recording)
             statusMessage = configuration.mode == .audioOnly ? "● 正在仅录音；未创建屏幕视频轨" : "● 正在录屏；可随时暂停或停止"
-            startMonitoring()
+            startMonitoring(sessionID: sessionID)
         } catch {
-            if let stream { try? await stream.stopCapture() }
-            stream = nil
-            audioRecorder?.stop(); audioRecorder = nil
-            if let pipeline { _ = try? await pipeline.finish(failure: error) }
-            pipeline = nil
+            guard activeSessionID == sessionID, state != .stopping else { return }
+            // Hold the controller in stopping while cleanup suspends. A callback from this
+            // failed startup must not run a second stop, or clean up a later session.
             if state != .preparing { try? changeState(.preparing) }
-            try? changeState(.failed)
-            statusMessage = error.localizedDescription
+            try? changeState(.stopping)
             stopMonitoring()
+            let oldStream = stream, oldPipeline = pipeline
+            stream = nil; pipeline = nil
+            audioRecorder?.delegate = nil
+            audioRecorder?.stop(); audioRecorder = nil; recorderDelegate = nil
+            if let oldStream {
+                try? await oldStream.stopCapture()
+                guard isCurrentSession(sessionID, in: [.stopping]) else { return }
+            }
+            if let oldPipeline {
+                _ = try? await oldPipeline.finish(failure: error)
+                guard isCurrentSession(sessionID, in: [.stopping]) else { return }
+            }
+            try? writeMicrophoneJournal(state: .failed, failure: error)
+            try? changeState(.failed)
+            activeSessionID = nil
+            statusMessage = error.localizedDescription
         }
     }
 
@@ -136,7 +175,10 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
     func resume() {
         guard state == .paused else { return }
         if let recorder = audioRecorder, !recorder.record() {
-            Task { await stop(failure: RecordingError.sourceUnavailable("麦克风无法恢复录音")) }; return
+            if let sessionID = activeSessionID {
+                _ = makeFailureHandler(for: sessionID)(RecordingError.sourceUnavailable("麦克风无法恢复录音"))
+            }
+            return
         }
         pipeline?.setPaused(false)
         try? changeState(.recording)
@@ -144,38 +186,53 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         statusMessage = "● 已继续录制"
     }
 
-    func stop() async { await stop(failure: nil) }
-    func cancel() async { await stop(failure: RecordingError.cancelled) }
+    func stop() async {
+        guard let sessionID = activeSessionID else { return }
+        await stop(failure: nil, sessionID: sessionID)
+    }
+    func cancel() async {
+        guard let sessionID = activeSessionID else { return }
+        await stop(failure: RecordingError.cancelled, sessionID: sessionID)
+    }
 
-    private func stop(failure: Error?) async {
-        guard state == .recording || state == .paused || state == .preparing else { return }
+    private func stop(failure: Error?, sessionID: UUID) async {
+        guard isCurrentSession(sessionID, in: [.recording, .paused, .preparing]) else { return }
         try? changeState(.stopping)
         let stoppedAtHostTime = CMClockGetTime(CMClockGetHostTimeClock())
         stopMonitoring()
         statusMessage = "正在完成媒体容器，请稍候"
         var captureError = failure
-        if let stream {
-            do { try await stream.stopCapture() }
-            catch { if captureError == nil { captureError = error } }
-        }
+        let oldStream = stream
         stream = nil
+        if let oldStream {
+            do { try await oldStream.stopCapture() }
+            catch { if captureError == nil { captureError = error } }
+            guard isCurrentSession(sessionID, in: [.stopping]) else { return }
+        }
         do {
-            guard let plan = filePlan, let config = activeConfiguration else { throw RecordingError.noSamples }
+            guard let plan = filePlan, let config = activeConfiguration else { throw captureError ?? RecordingError.noSamples }
             if let recorder = audioRecorder {
                 metrics.durationSeconds = recorder.currentTime
+                recorder.delegate = nil
                 recorder.stop()
-                audioRecorder = nil
+                audioRecorder = nil; recorderDelegate = nil
                 if let captureError { try? writeMicrophoneJournal(state: .failed, failure: captureError); throw captureError }
                 let asset = AVURLAsset(url: plan.partialURL)
                 let tracks = try await asset.loadTracks(withMediaType: .audio)
+                try requireSession(sessionID, in: [.stopping])
                 let duration = try await asset.load(.duration)
+                try requireSession(sessionID, in: [.stopping])
                 guard tracks.count == 1, duration.isNumeric, duration.seconds > 0 else { throw RecordingError.noSamples }
                 metrics.durationSeconds = duration.seconds
             } else if let pipeline {
-                metrics = try await pipeline.finish(failure: captureError, atHostTime: stoppedAtHostTime)
+                let finishedMetrics = try await pipeline.finish(failure: captureError, atHostTime: stoppedAtHostTime)
+                try requireSession(sessionID, in: [.stopping])
+                metrics = finishedMetrics
                 let asset = AVURLAsset(url: plan.partialURL)
                 let videoTracks = try await asset.loadTracks(withMediaType: .video)
+                try requireSession(sessionID, in: [.stopping])
                 let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+                try requireSession(sessionID, in: [.stopping])
                 let expectedAudio = (config.systemAudio ? 1 : 0) + (config.microphone ? 1 : 0)
                 guard videoTracks.count == (config.mode == .video ? 1 : 0), audioTracks.count == expectedAudio else {
                     throw RecordingError.writing("导出轨道核对失败；中间文件已保留")
@@ -186,20 +243,22 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
             try changeState(.idle)
             statusMessage = config.mode == .audioOnly ? "已保存仅音频文件（无视频轨）；请回放核对音源" : "已保存录屏；请回放核对画面与音画同步"
         } catch {
+            guard isCurrentSession(sessionID, in: [.stopping]) else { return }
             try? writeMicrophoneJournal(state: .failed, failure: error)
             try? changeState(.failed)
             statusMessage = "\(error.localizedDescription) 中间文件与恢复说明保留在所选输出目录。"
         }
-        pipeline = nil; audioRecorder = nil
+        pipeline = nil; audioRecorder = nil; recorderDelegate = nil; activeSessionID = nil
     }
 
     private func changeState(_ next: RecordingState) throws {
         try machine.transition(to: next); state = next
     }
 
-    private func makeCapture(_ configuration: RecordingConfiguration) async throws -> (SCContentFilter, SCStreamConfiguration) {
+    private func makeCapture(_ configuration: RecordingConfiguration, sessionID: UUID) async throws -> (SCContentFilter, SCStreamConfiguration) {
         guard let source = configuration.source else { throw RecordingError.sourceUnavailable("没有选定捕获源") }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        try requireSession(sessionID, in: [.preparing])
         let filter: SCContentFilter
         var rect: CGRect
         if source.kind == .window {
@@ -246,10 +305,10 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         return (filter, config)
     }
 
-    private func startMonitoring() {
+    private func startMonitoring(sessionID: UUID) {
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.isCurrentSession(sessionID, in: [.recording, .paused]) else { return }
                 if let pipeline = self.pipeline { self.metrics = pipeline.snapshot(); self.elapsed = self.metrics.durationSeconds }
                 if let recorder = self.audioRecorder {
                     self.elapsed = recorder.currentTime
@@ -261,16 +320,30 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                guard !Task.isCancelled, let self, self.state == .recording || self.state == .paused else { return }
-                do { try await self.checkSources(); try self.writeMicrophoneJournal(state: self.state) }
-                catch { await self.stop(failure: error); return }
+                guard !Task.isCancelled, let self, self.isCurrentSession(sessionID, in: [.recording, .paused]) else { return }
+                guard await self.monitorOnce(sessionID: sessionID, check: { try await self.checkSources(sessionID: sessionID) }) else { return }
             }
         }
     }
 
     private func stopMonitoring() { timer?.invalidate(); timer = nil; monitorTask?.cancel(); monitorTask = nil }
 
-    private func checkSources() async throws {
+    private func monitorOnce(sessionID: UUID, check: () async throws -> Void) async -> Bool {
+        guard !Task.isCancelled, isCurrentSession(sessionID, in: [.recording, .paused]) else { return false }
+        do {
+            try await check()
+            guard !Task.isCancelled, isCurrentSession(sessionID, in: [.recording, .paused]) else { return false }
+            try writeMicrophoneJournal(state: state)
+            return true
+        } catch {
+            guard !Task.isCancelled, isCurrentSession(sessionID, in: [.recording, .paused]) else { return false }
+            await stop(failure: error, sessionID: sessionID)
+            return false
+        }
+    }
+
+    private func checkSources(sessionID: UUID) async throws {
+        try requireSession(sessionID, in: [.recording, .paused])
         guard let config = activeConfiguration else { return }
         if let plan = filePlan,
            let free = RecordingDiskSpace.available(at: plan.finalURL.deletingLastPathComponent()),
@@ -297,6 +370,7 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         if config.needsScreenPermission {
             guard CGPreflightScreenCaptureAccess() else { throw RecordingError.permission("屏幕录制权限已撤销") }
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            try requireSession(sessionID, in: [.recording, .paused])
             if config.source?.kind == .window {
                 guard content.windows.contains(where: { $0.windowID == config.source?.windowID && $0.owningApplication?.processID == config.source?.processID }) else {
                     throw RecordingError.sourceUnavailable("选定窗口已关闭或进程已变化")
@@ -317,12 +391,53 @@ final class RecordingController: NSObject, ObservableObject, AVAudioRecorderDele
         try plan.writeJournal(record)
     }
 
-    nonisolated func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
-        Task { @MainActor [weak self] in await self?.stop(failure: error ?? RecordingError.writing("麦克风编码器失败")) }
+    private func isCurrentSession(_ sessionID: UUID, in states: [RecordingState]) -> Bool {
+        activeSessionID == sessionID && states.contains(state)
     }
-    nonisolated func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-        guard !flag else { return }
-        Task { @MainActor [weak self] in await self?.stop(failure: RecordingError.writing("麦克风录音意外停止")) }
+
+    private func requireSession(_ sessionID: UUID, in states: [RecordingState]) throws {
+        guard isCurrentSession(sessionID, in: states), !Task.isCancelled else { throw CancellationError() }
+    }
+
+    /// The closure captures the producer's session before crossing from its callback queue.
+    /// Both the writer and each recorder's own delegate use this exact path.
+    private func makeFailureHandler(for sessionID: UUID) -> (Error) -> Task<Void, Never> {
+        { [weak self] error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.stop(failure: error, sessionID: sessionID)
+            }
+        }
+    }
+
+    #if RECORDING_SESSION_TESTS
+    // Test setup never constructs a recorder/stream or queries devices. Failures still run
+    // the production callback, monitor, and stop paths instead of a duplicate gate policy.
+    func beginIsolatedSessionForTesting() throws -> UUID {
+        guard state == .idle || state == .failed else { throw RecordingError.invalidState("测试会话仍活动") }
+        let sessionID = UUID()
+        activeSessionID = sessionID
+        try changeState(.preparing)
+        try changeState(.recording)
+        return sessionID
+    }
+    func failureHandlerForTesting(sessionID: UUID) -> (Error) -> Task<Void, Never> { makeFailureHandler(for: sessionID) }
+    func monitorOnceForTesting(sessionID: UUID, check: () async throws -> Void) async -> Bool {
+        await monitorOnce(sessionID: sessionID, check: check)
+    }
+    #endif
+}
+
+/// AVAudioRecorder's delegate is weak. Keep one proxy per session, never reuse the
+/// controller as every old recorder's delegate with access to the current session.
+private final class RecordingRecorderDelegate: NSObject, AVAudioRecorderDelegate {
+    private let onFailure: (Error) -> Void
+    init(onFailure: @escaping (Error) -> Void) { self.onFailure = onFailure }
+    func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
+        onFailure(error ?? RecordingError.writing("麦克风编码器失败"))
+    }
+    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        if !flag { onFailure(RecordingError.writing("麦克风录音意外停止")) }
     }
 }
 

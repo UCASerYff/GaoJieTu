@@ -33,25 +33,55 @@ enum RecordingRecovery {
             let audios = try await asset.loadTracks(withMediaType: .audio)
             let duration = try await asset.load(.duration)
             guard duration.isNumeric, duration.seconds > 0, !videos.isEmpty || !audios.isEmpty else { throw RecordingError.noSamples }
+            let checkedMedia: String
             if let video = videos.first {
                 _ = video
                 let generator = AVAssetImageGenerator(asset: asset)
                 _ = try generator.copyCGImage(at: .zero, actualTime: nil)
-            } else if let audio = audios.first {
-                let reader = try AVAssetReader(asset: asset)
-                let output = AVAssetReaderTrackOutput(track: audio, outputSettings: nil)
-                reader.add(output)
-                guard reader.startReading(), output.copyNextSampleBuffer() != nil else { throw reader.error ?? RecordingError.noSamples }
-                reader.cancelReading()
+                checkedMedia = "首个视频样本可解码"
+            } else {
+                for audio in audios { try decodeAudioFrames(asset: asset, track: audio) }
+                checkedMedia = "每条音频轨均已实际解码出非空 PCM 帧"
             }
             return RecordingRecoveryInspection(record: record, journalURL: journal, mediaURL: media, canRecover: true,
-                reason: "容器可读取且首个媒体样本可解码；可复制为新文件，再由用户完整回放核对。", videoTracks: videos.count,
+                reason: "容器可读取，\(checkedMedia)；可复制为新文件，再由用户完整回放核对。", videoTracks: videos.count,
                 audioTracks: audios.count, durationSeconds: duration.seconds)
         } catch {
             return RecordingRecoveryInspection(record: record, journalURL: journal, mediaURL: media, canRecover: false,
                 reason: "中间媒体未完成或不可解码：\(error.localizedDescription) 原件与恢复说明继续保留，不声称可修复。",
                 videoTracks: 0, audioTracks: 0, durationSeconds: nil)
         }
+    }
+
+    private static func decodeAudioFrames(asset: AVAsset, track: AVAssetTrack) throws {
+        let reader = try AVAssetReader(asset: asset)
+        // nil output settings only return encoded packets (or marker-only buffers).
+        // Request PCM so a readable container alone cannot be mistaken for decodable audio.
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false, AVLinearPCMIsNonInterleaved: false,
+            AVLinearPCMIsBigEndianKey: false
+        ])
+        guard reader.canAdd(output) else { throw RecordingError.writing("无法创建音频解码器") }
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? RecordingError.noSamples }
+        defer { reader.cancelReading() }
+        while let buffer = output.copyNextSampleBuffer() {
+            try Task.checkCancellation()
+            let frames = CMSampleBufferGetNumSamples(buffer)
+            if frames == 0 { continue }
+            guard CMSampleBufferIsValid(buffer), CMSampleBufferDataIsReady(buffer),
+                  let description = CMSampleBufferGetFormatDescription(buffer),
+                  let format = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee,
+                  format.mFormatID == kAudioFormatLinearPCM, format.mBytesPerFrame > 0,
+                  frames <= Int.max / Int(format.mBytesPerFrame),
+                  let data = CMSampleBufferGetDataBuffer(buffer),
+                  CMBlockBufferGetDataLength(data) >= frames * Int(format.mBytesPerFrame) else {
+                throw RecordingError.writing("音频解码未返回有效的非空 PCM 帧")
+            }
+            return
+        }
+        throw reader.error ?? RecordingError.noSamples
     }
 
     /// Copies a verified playable intermediate to a new user-selected file, keeping both the original and its journal.

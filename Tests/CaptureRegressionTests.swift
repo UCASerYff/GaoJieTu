@@ -94,6 +94,7 @@ func runCaptureRegressionTests() throws {
     try captureRegressionCheck(400 * PinnedImageGeometry.actualPixelScale(backingScale: 2) * 2 == 400, "1:1 on Retina must keep physical pixel count unchanged")
     print("PASS Capture regressions: front-to-back hit, selected scroll anchor, corresponding seam previews and adjustment, fractional 1x/2x region snapping, current-screen pin scale (no GUI/capture).")
     try runCaptureWindowEventRegressionTests()
+    try runCaptureSelectionLabelRegressionTests()
 }
 
 /// Regression for the actual full-screen Dock overlay mis-hit. Framework event conversion is injected;
@@ -141,4 +142,35 @@ func runCaptureWindowEventRegressionTests() throws {
     try captureRegressionCheck(selection == CGRect(x: -380, y: 380, width: 30, height: 30), "Dragging must use its two converted event positions")
     try captureRegressionCheck(CaptureGeometry.appKitToDesktop(selection, mainDisplayTop: 1000) == CGRect(x: -380, y: 590, width: 30, height: 30), "The final event-derived selection must keep its real desktop coordinates")
     print("PASS Window-event regressions: layer/alpha/system-owner filtering, full-screen Dock exclusion, event-local conversion and directed-click/drag coordinates (no GUI/capture).")
+}
+
+/// Display/selection values only. No NSScreen enumeration, event posting, panels or capture.
+func runCaptureSelectionLabelRegressionTests() throws {
+    let fixtures: [(screen: CGRect, selection: CGRect, mainTop: CGFloat, scale: CGFloat, local: CGRect, pixels: CGRect)] = [
+        (CGRect(x: 0, y: 0, width: 100, height: 100), CGRect(x: 0.25, y: 92.5, width: 11.5, height: 5), 100, 2,
+         CGRect(x: 0.25, y: 2.5, width: 11.5, height: 5), CGRect(x: 0, y: 5, width: 24, height: 10)),
+        (CGRect(x: 0, y: 0, width: 100, height: 100), CGRect(x: 1.2, y: 94.3, width: 2.4, height: 3.4), 100, 1,
+         CGRect(x: 1.2, y: 2.3, width: 2.4, height: 3.4), CGRect(x: 1, y: 2, width: 3, height: 4)),
+        (CGRect(x: -500, y: -200, width: 100, height: 100), CGRect(x: -499.75, y: -107.5, width: 11.5, height: 5), 1000, 2,
+         CGRect(x: 0.25, y: 2.5, width: 11.5, height: 5), CGRect(x: 0, y: 5, width: 24, height: 10)),
+        (CGRect(x: -500, y: -200, width: 100, height: 100), CGRect(x: -500.25, y: -106.75, width: 4, height: 7), 1000, 2,
+         CGRect(x: -0.25, y: -0.25, width: 4, height: 7), CGRect(x: 0, y: 0, width: 8, height: 14)),
+        (CGRect(x: -500, y: -200, width: 100, height: 100), CGRect(x: -500.25, y: -203.25, width: 4, height: 4), 1000, 2,
+         CGRect(x: -0.25, y: 99.25, width: 4, height: 4), CGRect(x: 0, y: 198, width: 8, height: 2)),
+        (CGRect(x: 100, y: 200, width: 80, height: 60), CGRect(x: 100.2, y: 254.75, width: 5.5, height: 4), 1000, 1,
+         CGRect(x: 0.2, y: 1.25, width: 5.5, height: 4), CGRect(x: 0, y: 1, width: 6, height: 5))
+    ]
+    for fixture in fixtures {
+        let label = try CaptureSelectionGeometry.regionPlan(selectionInAppKit: fixture.selection, screenFrameInAppKit: fixture.screen, mainDisplayTop: fixture.mainTop, scale: fixture.scale)
+        let capture = try CaptureGeometry.normalizedRegion(fixture.local, displaySize: fixture.screen.size, scale: fixture.scale)
+        try captureRegressionCheck(label.pixelRect == fixture.pixels, "Selection labels must use expected outward-rounded physical pixels, including clipped edges")
+        try captureRegressionCheck(label.pixelRect == capture.pixelRect && label.sourceRect == capture.sourceRect, "The label and actual capture plan must describe the same display-local pixels")
+    }
+    let fractional = fixtures[0]
+    try captureRegressionCheck(ceil(fractional.selection.width * fractional.scale) == 23 && fractional.pixels.width == 24, "The regression must distinguish the former width-only rounding from correct edge rounding")
+    do {
+        _ = try CaptureSelectionGeometry.regionPlan(selectionInAppKit: CGRect(x: -800, y: -800, width: 5, height: 5), screenFrameInAppKit: fixtures[2].screen, mainDisplayTop: 1000, scale: 2)
+        throw NSError(domain: "CaptureRegressionTests", code: 3, userInfo: [NSLocalizedDescriptionKey: "Off-screen label range was accepted"])
+    } catch CaptureFailure.invalidRegion {}
+    print("PASS Selection label: fractional 1x/2x, negative/positive display origins and clipped edges agree with actual normalized capture plans; no GUI, capture, or real data access.")
 }

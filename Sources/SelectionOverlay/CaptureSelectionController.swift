@@ -19,6 +19,14 @@ enum CaptureSelectionGeometry {
     static func selectionRect(from start: CGPoint, to end: CGPoint) -> CGRect {
         CGRect(x: min(start.x, end.x), y: min(start.y, end.y), width: abs(end.x - start.x), height: abs(end.y - start.y))
     }
+
+    /// Use the same display-local desktop coordinates and outward pixel snapping as actual capture.
+    static func regionPlan(selectionInAppKit: CGRect, screenFrameInAppKit: CGRect, mainDisplayTop: CGFloat, scale: CGFloat) throws -> CaptureRegionPlan {
+        let display = CaptureGeometry.appKitToDesktop(screenFrameInAppKit, mainDisplayTop: mainDisplayTop)
+        let selection = CaptureGeometry.appKitToDesktop(selectionInAppKit, mainDisplayTop: mainDisplayTop)
+        let local = selection.offsetBy(dx: -display.minX, dy: -display.minY)
+        return try CaptureGeometry.normalizedRegion(local, displaySize: display.size, scale: scale)
+    }
 }
 
 @MainActor
@@ -128,8 +136,8 @@ final class CaptureSelectionController {
         let desktop = CaptureGeometry.appKitToDesktop(selection, mainDisplayTop: mainTop)
         let screens = NSScreen.screens.filter { $0.frame.intersects(selection) }
         let pixels = screens.map { screen -> String in
-            let intersection = screen.frame.intersection(selection)
-            return "\(Int(ceil(intersection.width * screen.backingScaleFactor))) × \(Int(ceil(intersection.height * screen.backingScaleFactor))) px @\(Int(screen.backingScaleFactor))x"
+            guard let plan = try? CaptureSelectionGeometry.regionPlan(selectionInAppKit: selection, screenFrameInAppKit: screen.frame, mainDisplayTop: mainTop, scale: screen.backingScaleFactor) else { return "像素范围无效" }
+            return "\(Int(plan.pixelRect.width)) × \(Int(plan.pixelRect.height)) px @\(Int(screen.backingScaleFactor))x"
         }.joined(separator: "；")
         if selection.width < 1 || selection.height < 1 { return "拖动选择截图区域\nReturn 确认 · Esc 取消" }
         return "\(Int(selection.width)) × \(Int(selection.height)) 点 · (\(Int(desktop.minX)), \(Int(desktop.minY)))\n\(pixels)\n方向键移动 · Option+方向键调尺寸 · Shift 10点 · Return 确认 · Esc 取消"

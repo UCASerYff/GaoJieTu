@@ -46,7 +46,7 @@ func runActionRegressionTests(in directory: URL) async throws {
     try actionRegressionRequire(firstOriginal.string?.contains("NATIVE HEADER") == true && firstOriginal.string?.contains("SCANNED BODY") != true, "sample has a native header and genuinely image-only body")
     var options = OCROptions(); options.languages = ["en-US"]
     let document = try await OCRService().recognize(urls: [input], options: options)
-    try actionRegressionRequire(document.successfulPages == 2 && document.text.contains("SCANNED BODY 2026"), "real OCR recognizes hybrid image body")
+    try actionRegressionRequire(document.successfulPages == 2 && document.text.contains("SCANNED BODY 2026"), "real OCR recognizes hybrid image body: " + document.pages.map { "\($0.status.rawValue): \($0.failureReason ?? $0.text)" }.joined(separator: " | "))
     let searchable = directory.appendingPathComponent("hybrid-searchable.pdf")
     let validation = try OCRExporter.exportSearchablePDF(document: document, sourceID: document.sources[0].id, sourceURL: input, to: searchable)
     try actionRegressionRequire(validation.pageCount == 2 && validation.rasterizedPages == [1, 2] && validation.verifiedTextLines >= 4, "hybrid pages rebuild one complete positioned text layer")

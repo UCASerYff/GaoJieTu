@@ -45,8 +45,8 @@ enum OCRExporter {
         guard !cancellation.isCancelled else { throw CancellationError() }
         guard document.schemaVersion == 1, let source = document.sources.first(where: { $0.id == sourceID }), !source.sha256.isEmpty else { throw OCRError.invalidDocument }
         guard sourceURL.standardizedFileURL != destination.standardizedFileURL, !FileManager.default.fileExists(atPath: destination.path) else { throw OCRError.outputExists }
+        try validateExportBudget(source: source, options: document.options)
         guard try OCRService.sha256(url: sourceURL, limit: document.options.maxFileBytes) == source.sha256 else { throw OCRError.validation("原件摘要变化；原件未覆盖。") }
-        guard (1...document.options.maxPages).contains(source.pageCount), source.byteCount <= document.options.maxFileBytes else { throw OCRError.resourceLimit("导出原件页数或大小超限。") }
         let original = try OCRService.readVerifiedData(sourceURL, source: source)
         let temp = destination.deletingLastPathComponent().appendingPathComponent(".gaojietu-ocr-\(UUID().uuidString).pdf")
         let rotatedTemp = destination.deletingLastPathComponent().appendingPathComponent(".gaojietu-ocr-\(UUID().uuidString).pdf")
@@ -61,11 +61,18 @@ enum OCRExporter {
             guard let provider = CGDataProvider(data: original as CFData), let pdf = CGPDFDocument(provider) else { throw OCRError.invalidInput("PDF 原件无法读取。") }
             originalPDF = pdf
         } else {
-            guard let imageSource = CGImageSourceCreateWithData(original as CFData, nil), let raw = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else { throw OCRError.invalidInput("图像原件无法读取。") }
-            let props = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any]
-            let orientation = props?[kCGImagePropertyOrientation] as? Int32 ?? 1
+            guard let imageSource = CGImageSourceCreateWithData(original as CFData, nil),
+                  let props = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any],
+                  let width = props[kCGImagePropertyPixelWidth] as? Int,
+                  let height = props[kCGImagePropertyPixelHeight] as? Int else { throw OCRError.invalidInput("图像缺少有效尺寸。") }
+            // A failed OCR page can still be exported for its original visuals. Check before
+            // decoding so that a pixel-limit failure cannot bypass the recognition budget.
+            try validateImageDimensions(width: width, height: height, options: document.options)
+            guard let raw = CGImageSourceCreateImageAtIndex(imageSource, 0, nil), raw.width == width, raw.height == height else { throw OCRError.invalidInput("图像原件无法读取或尺寸变化。") }
+            let orientation = props[kCGImagePropertyOrientation] as? Int32 ?? 1
             let ci = CIImage(cgImage: raw).oriented(forExifOrientation: orientation)
             image = orientation == 1 ? raw : CIContext(options: [.cacheIntermediates: false, .useSoftwareRenderer: true]).createCGImage(ci, from: ci.extent)
+            guard image != nil else { throw OCRError.invalidInput("图像方向转换失败。") }
         }
         var geometry: [(CGRect, CGRect, Int)] = []
         var rasterizedPages: [Int] = []
@@ -122,6 +129,25 @@ enum OCRExporter {
         try FileManager.default.moveItem(at: rotatedTemp, to: destination)
         progress(OCRPDFExportProgress(phase: .finished, completedPages: source.pageCount, totalPages: source.pageCount))
         return validation
+    }
+
+    /// Match OCRService's compressed-input and render-buffer limits before reading/decoding.
+    private static func validateExportBudget(source: OCRSource, options: OCROptions) throws {
+        guard (1...1_000).contains(options.maxPages), (1_000...48_000_000).contains(options.maxPixelsPerPage),
+              (72...300).contains(options.pdfDPI), options.maxFileBytes > 0,
+              options.memoryBudgetBytes >= 32 * 1024 * 1024 else { throw OCRError.resourceLimit("导出页数、分辨率或内存预算无效。") }
+        guard (1...options.maxPages).contains(source.pageCount), source.byteCount > 0,
+              source.byteCount <= options.maxFileBytes,
+              source.byteCount < Int64(options.memoryBudgetBytes / 2) else { throw OCRError.resourceLimit("导出原件页数或大小超限。") }
+        let (buffers, bufferOverflow) = Int64(options.maxPixelsPerPage).multipliedReportingOverflow(by: 12)
+        let (peak, peakOverflow) = source.byteCount.addingReportingOverflow(buffers)
+        guard !bufferOverflow, !peakOverflow, peak <= Int64(options.memoryBudgetBytes) else { throw OCRError.resourceLimit("原件与导出页面缓冲超过内存预算，请减小每页像素上限或分批。") }
+    }
+
+    private static func validateImageDimensions(width: Int, height: Int, options: OCROptions) throws {
+        guard width > 0, height > 0, width <= 12_000, height <= 12_000 else { throw OCRError.resourceLimit("图像原件尺寸超出安全范围，请先明确缩小图像。") }
+        let (pixels, overflow) = Int64(width).multipliedReportingOverflow(by: Int64(height))
+        guard !overflow, pixels <= Int64(options.maxPixelsPerPage) else { throw OCRError.resourceLimit("原图 \(width)×\(height) 超过导出像素限制，请先明确缩小图像。") }
     }
 
     private static func drawInvisible(line: OCRLine, context: CGContext) {

@@ -43,10 +43,10 @@ struct RecordingView:View {
                 if audioOnly && microphone && !systemAudio {Text(String(format:"麦克风电平 %.0f dB",controller.microphonePowerDB)).font(.caption)}
                 if let url=controller.lastOutputURL {HStack{Text("已完成：\(url.lastPathComponent)");Button("显示文件"){NSWorkspace.shared.activateFileViewerSelecting([url])};Button("混音导出 M4A…"){exportAudio(url)}}}
                 if let recovery=controller.recoveryURL {Button("显示恢复材料"){NSWorkspace.shared.activateFileViewerSelecting([recovery])}}
-                HStack {Text("视频帧 \(controller.metrics.videoFrames) · 掉帧 \(controller.metrics.droppedVideoFrames) · 系统音缓冲 \(controller.metrics.systemAudioBuffers) · 麦克风缓冲 \(controller.metrics.microphoneBuffers)").font(.caption);Spacer();Button("恢复中断录制…"){recover()}.disabled(active)}
+                HStack {Text("视频帧 \(controller.metrics.videoFrames) · 掉帧 \(controller.metrics.droppedVideoFrames) · 系统音缓冲 \(controller.metrics.systemAudioBuffers) · 麦克风缓冲 \(controller.metrics.microphoneBuffers) · 丢弃音频缓冲 \(controller.metrics.droppedAudioBuffers)").font(.caption);Spacer();Button("恢复中断录制…"){recover()}.disabled(active)}
                 Divider()
                 gifControls
-                Text("音源变化、权限撤销或磁盘不足会停止并保留恢复说明。系统音与麦克风分别成轨；仅麦克风支持 M4A。崩溃中断的 MOV 不保证可修复。").foregroundStyle(.secondary).font(.callout)
+                Text("系统声音输出设备变化会暂停，核对音源后可继续；所选麦克风丢失、独立录音的系统输入变化、权限撤销或磁盘不足会停止并保留恢复说明。系统音与麦克风分别成轨；仅麦克风支持 M4A。崩溃中断的 MOV 不保证可修复。").foregroundStyle(.secondary).font(.callout)
             }.padding(24)
         }
     }
