@@ -11,7 +11,7 @@ import Foundation
 }
 SWIFT
 xcrun swiftc -Xfrontend -disable-sandbox -swift-version 5 -target arm64-apple-macos14.0 -module-cache-path /private/tmp/GaoJieTuModuleCache \
-    Sources/Capture/CaptureService.swift Sources/Capture/LongScreenshotSession.swift \
+    Sources/Capture/CaptureService.swift Sources/Capture/ScrollTargetGuard.swift Sources/Capture/LongScreenshotSession.swift \
     Sources/PinnedImage/PinnedImageController.swift Sources/SelectionOverlay/CaptureSelectionController.swift \
     Tests/CaptureRegressionTests.swift "$LABEL_TEST_STAGE/SelectionLabelTestMain.swift" -o "$LABEL_TEST_STAGE/SelectionLabelTests"
 "$LABEL_TEST_STAGE/SelectionLabelTests"

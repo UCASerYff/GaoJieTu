@@ -96,6 +96,17 @@ enum CaptureWindowEligibility {
         }
         return !desktopOwnerNames.contains(ownerName.lowercased())
     }
+
+    static func validFrame(_ frame: CGRect?) -> Bool {
+        guard let frame else { return false }
+        return frame.minX.isFinite && frame.minY.isFinite && frame.maxX.isFinite && frame.maxY.isFinite
+            && frame.width > 1 && frame.height > 1
+    }
+
+    /// The picker and the long-capture guard must reject the same empty/transparent/system entries.
+    static func allows(layer: Int?, alpha: Double?, processID: pid_t?, bundleID: String?, ownerName: String, frame: CGRect?) -> Bool {
+        validFrame(frame) && allows(layer: layer, alpha: alpha, processID: processID, bundleID: bundleID, ownerName: ownerName)
+    }
 }
 
 enum CaptureWindowHitTesting {
@@ -109,7 +120,7 @@ enum CaptureWindowHitTesting {
         windows.enumerated().filter {
             let window = $0.element
             return window.isOnScreen && window.zOrder != nil && window.frame.contains(point)
-                && CaptureWindowEligibility.allows(layer: window.windowLayer, alpha: window.alpha, processID: window.processID, bundleID: window.bundleID, ownerName: window.applicationName)
+                && CaptureWindowEligibility.allows(layer: window.windowLayer, alpha: window.alpha, processID: window.processID, bundleID: window.bundleID, ownerName: window.applicationName, frame: window.frame)
         }
             .min { left, right in
                 let leftRank = left.element.zOrder!, rightRank = right.element.zOrder!
@@ -205,8 +216,11 @@ final class CaptureService {
                   let layer = (metadata[kCGWindowLayer as String] as? NSNumber)?.intValue,
                   let alpha = (metadata[kCGWindowAlpha as String] as? NSNumber)?.doubleValue,
                   let ownerPID = (metadata[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  let rawBounds = metadata[kCGWindowBounds as String] as? [String: Any],
+                  let metadataFrame = CGRect(dictionaryRepresentation: rawBounds as CFDictionary),
                   ownerPID == application.processID,
-                  CaptureWindowEligibility.allows(layer: layer, alpha: alpha, processID: ownerPID, bundleID: application.bundleIdentifier, ownerName: application.applicationName) else { return nil }
+                  CaptureWindowEligibility.validFrame(metadataFrame),
+                  CaptureWindowEligibility.allows(layer: layer, alpha: alpha, processID: ownerPID, bundleID: application.bundleIdentifier, ownerName: application.applicationName, frame: window.frame) else { return nil }
             return CaptureWindow(id: window.windowID, title: window.title ?? "无标题窗口", applicationName: application.applicationName,
                                  processID: application.processID, frame: window.frame, isOnScreen: true, zOrder: ranks[window.windowID],
                                  windowLayer: layer, alpha: alpha, bundleID: application.bundleIdentifier)

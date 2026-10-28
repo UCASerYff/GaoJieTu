@@ -83,6 +83,9 @@ final class LongScreenshotSession {
     private(set) var estimatedPeakMemoryBytes = 0
     private var segments: [ScrollFrameSegment] = []
     private var pendingImage: CGImage?
+    private var targetProbe: ScrollTargetProbing?
+    private let targetGuard: ScrollTargetGuard?
+    private(set) var lastTargetDiagnostic: ScrollTargetDiagnostic?
     var pendingFrameHeight: Int? { pendingImage?.height }
 
     func pendingPreview(overlapPixels: Int) throws -> ScrollSeamPreview? {
@@ -91,8 +94,9 @@ final class LongScreenshotSession {
         return try ScrollSeamPreviewRenderer.make(previous: previous, current: current, overlapPixels: overlapPixels)
     }
 
-    init(target: ScrollTargetIdentity? = nil, budget: ScrollCaptureBudget = .init()) {
-        self.target = target; self.budget = budget
+    init(target: ScrollTargetIdentity? = nil, budget: ScrollCaptureBudget = .init(), targetProbe: ScrollTargetProbing? = nil) {
+        self.target = target; self.budget = budget; self.targetProbe = targetProbe
+        self.targetGuard = target.map { ScrollTargetGuard(target: $0) }
     }
 
     /// Manual frames from the same view are supported without Accessibility permission.
@@ -139,10 +143,20 @@ final class LongScreenshotSession {
     /// Real capture verifies the foreground PID and selected window before and after every frame.
     @discardableResult
     func captureNext(using service: CaptureService, source: CaptureSource, options: CaptureOptions = .init()) async throws -> ScrollSeamEstimate? {
-        try validateCurrentTarget()
-        let frame = try await service.capture(source, options: options)
-        try validateCurrentTarget()
-        return try addFrame(frame.image)
+        try await captureNext(capturing: { try await service.capture(source, options: options).image })
+    }
+
+    /// The same production transaction accepts an in-memory producer in isolated CLI tests.
+    /// No frame is committed until the second target check and cancellation check both pass.
+    @discardableResult
+    func captureNext(capturing capture: () async throws -> CGImage) async throws -> ScrollSeamEstimate? {
+        try Task.checkCancellation()
+        try validateCurrentTarget(stage: .preCapture)
+        let image = try await capture()
+        try Task.checkCancellation()
+        try validateCurrentTarget(stage: .postCapture)
+        try Task.checkCancellation()
+        return try addFrame(image)
     }
 
     /// A single explicit scroll action, never a hidden global loop. A changed target immediately pauses.
@@ -150,16 +164,26 @@ final class LongScreenshotSession {
     func scrollAndCapture(using service: CaptureService, source: CaptureSource, downwardPoints: Int32 = 240, options: CaptureOptions = .init()) async throws -> ScrollSeamEstimate? {
         guard let target else { throw CaptureFailure.unsupported("自动滚动需要明确的目标窗口；无目标时请手动滚动。") }
         guard AXIsProcessTrusted() else { throw CaptureFailure.unsupported("辅助功能权限未授权，仍可使用手动滚动逐帧拼接。") }
+        return try await scrollAndCapture(downwardPoints: downwardPoints, performScroll: { anchor in
+            guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: -downwardPoints, wheel2: 0, wheel3: 0) else { throw CaptureFailure.sourceMissing }
+            event.location = anchor
+            event.postToPid(target.processID)
+            try await Task.sleep(nanoseconds: 450_000_000)
+        }, capturing: { try await service.capture(source, options: options).image })
+    }
+
+    /// Injects only the producer and explicit one-shot action, keeping all production guard stages.
+    @discardableResult
+    func scrollAndCapture(downwardPoints: Int32 = 240, performScroll: (CGPoint) async throws -> Void,
+                          capturing capture: () async throws -> CGImage) async throws -> ScrollSeamEstimate? {
+        guard let target else { throw CaptureFailure.unsupported("自动滚动需要明确的目标窗口；无目标时请手动滚动。") }
         guard downwardPoints <= 2_000, downwardPoints > 0 else { throw CaptureFailure.invalidRegion }
-        try validateCurrentTarget()
-        guard let info = currentTargetWindow(), let rawBounds = info[kCGWindowBounds as String] as? [String: Any],
-              let bounds = CGRect(dictionaryRepresentation: rawBounds as CFDictionary),
-              let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: -downwardPoints, wheel2: 0, wheel3: 0) else { throw CaptureFailure.sourceMissing }
-        event.location = try ScrollCaptureGeometry.scrollAnchor(windowBounds: bounds, selectedRegion: target.scrollRegion)
-        event.postToPid(target.processID)
-        try await Task.sleep(nanoseconds: 450_000_000)
-        try Task.checkCancellation(); try validateCurrentTarget()
-        return try await captureNext(using: service, source: source, options: options)
+        try Task.checkCancellation()
+        guard let bounds = try validateCurrentTarget(stage: .preScroll) else { throw CaptureFailure.sourceMissing }
+        try await performScroll(ScrollCaptureGeometry.scrollAnchor(windowBounds: bounds, selectedRegion: target.scrollRegion))
+        try Task.checkCancellation()
+        try validateCurrentTarget(stage: .postScroll)
+        return try await captureNext(capturing: capture)
     }
 
     func finish() throws -> CGImage {
@@ -180,31 +204,35 @@ final class LongScreenshotSession {
         return output
     }
 
-    /// Testable target guard, also called with live metadata by validateCurrentTarget().
+    /// Compatibility entry for existing synthetic tests; real capture always supplies a full snapshot.
     func validateTarget(frontmostPID: pid_t?, activeWindowID: CGWindowID?, activeWindowFrame: CGRect? = nil) throws {
         guard let target else { return }
-        guard frontmostPID == target.processID, activeWindowID == target.windowID else {
-            state = .paused("目标焦点或窗口改变，已停止滚动和捕获。")
-            throw CaptureFailure.unsupported("目标焦点或窗口改变，请回到原窗口后重试。")
-        }
-        if let expected = target.frame, activeWindowFrame != expected {
-            state = .paused("目标窗口位置或大小改变，请重新选择内容范围。")
-            throw CaptureFailure.unsupported("目标窗口位置或大小改变，已停止捕获，避免截取错误范围。")
+        let frame = activeWindowFrame ?? (target.frame == nil ? CGRect(x: 0, y: 0, width: 2, height: 2) : nil)
+        let windows = activeWindowID.map { [ScrollWindowMetadata(windowID: $0, processID: target.processID, frame: frame)] } ?? []
+        _ = try validateTarget(ScrollTargetSnapshot(frontmostPID: frontmostPID, windows: windows, focus: .accessibilityUnavailable), stage: .preCapture)
+    }
+
+    @discardableResult
+    func validateTarget(_ snapshot: ScrollTargetSnapshot, stage: ScrollTargetCheckStage) throws -> CGRect? {
+        guard let target, let targetGuard else { return nil }
+        do {
+            return try targetGuard.validate(snapshot, requiresAccessibility: stage == .preScroll || stage == .postScroll)
+        } catch let failure as ScrollTargetValidationFailure {
+            let diagnostic = ScrollTargetDiagnostic(stage: stage, expectedPID: Int64(target.processID),
+                actualPID: failure.actualPID.map(Int64.init) ?? ScrollTargetDiagnostic.unknown,
+                expectedWindowID: Int64(target.windowID), actualWindowID: failure.actualWindowID.map(Int64.init) ?? ScrollTargetDiagnostic.unknown)
+            lastTargetDiagnostic = diagnostic; diagnostic.recordFailure()
+            state = .paused(failure.reason.message)
+            throw CaptureFailure.unsupported(failure.reason.message)
         }
     }
 
-    private func currentTargetWindow() -> [String: Any]? {
+    @discardableResult
+    private func validateCurrentTarget(stage: ScrollTargetCheckStage) throws -> CGRect? {
         guard let target else { return nil }
-        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        // The first normal window owned by the target is the active candidate; modal/other windows pause us.
-        return windows.first { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == target.processID && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0 }
-    }
-
-    private func validateCurrentTarget() throws {
-        let current = currentTargetWindow()
-        let id = (current?[kCGWindowNumber as String] as? NSNumber)?.uint32Value
-        let frame = (current?[kCGWindowBounds as String] as? [String: Any]).flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
-        try validateTarget(frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier, activeWindowID: id, activeWindowFrame: frame)
+        if targetProbe == nil { targetProbe = LiveScrollTargetProbe() }
+        guard let targetProbe else { throw CaptureFailure.sourceMissing }
+        return try validateTarget(targetProbe.sample(target: target), stage: stage)
     }
 
     private func normalized(_ image: CGImage) throws -> CGImage {
