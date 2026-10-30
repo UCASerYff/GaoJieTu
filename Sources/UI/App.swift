@@ -43,6 +43,14 @@ import Combine
     }
     func application(_ application:NSApplication,open urls:[URL]){Task{await AppModel.shared.receive(urls)}}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
+        if AppModel.shared.selection.isSelecting {
+            let model=AppModel.shared
+            if model.longCaptureOperation != nil || model.captureTask != nil { model.cancelCaptureWork() }
+            else { model.selection.cancel() }
+            AppModel.shared.message="已取消截图选择。请再次退出以关闭应用。"
+            AppModel.shared.showMain()
+            return .terminateCancel
+        }
         if [.recording,.paused,.preparing,.stopping].contains(AppModel.shared.recording.state) || AppModel.shared.ocr.isRunning || AppModel.shared.exchange.isExecuting || AppModel.shared.busy{AppModel.shared.message="正在处理，请先停止录制或取消当前任务后退出。";AppModel.shared.showMain();return .terminateCancel};try? FileManager.default.removeItem(at:AppModel.shared.sessionTemporaryDirectory);return .terminateNow
     }
     @objc func translateSelection(_ pasteboard:NSPasteboard,userData:String?,error:AutoreleasingUnsafeMutablePointer<NSString?>) {

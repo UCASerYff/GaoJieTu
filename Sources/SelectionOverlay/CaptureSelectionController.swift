@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import OSLog
 
 struct CaptureRegionSelection {
     /// Top-left desktop coordinate system, logical points. May intersect several displays.
@@ -40,6 +41,11 @@ final class CaptureSelectionController {
     private var highlightedWindows: [CaptureWindow] = []
     private var windowPicked: ((CGWindowID?) -> Void)?
     private var latestScreenPoint: CGPoint?
+    private var inputNotice: String?
+
+    var isSelecting: Bool { !panels.isEmpty || continuation != nil || windowPicked != nil }
+
+    private enum InputEvent: Int { case presented = 1, mouseDown, controlKey, windowMiss, invalidRegion, cancelled, finished }
 
     /// User-visible selection only. No screenshot is taken while panels exist; completion closes every panel first.
     func selectRegion() async -> CaptureRegionSelection? {
@@ -61,35 +67,44 @@ final class CaptureSelectionController {
     }
 
     func cancel() { finish(cancelled: true) }
+    fileprivate func cancelFromButton() { finish(cancelled: true, cancelSource: 1) }
+    fileprivate func cancelFromResponder() { finish(cancelled: true, cancelSource: 2) }
 
     private func present(windows: [CaptureWindow]) {
         highlightedWindows = windows
         mainTop = NSScreen.screens.first?.frame.maxY ?? 0
         selection = .zero
-        latestScreenPoint = nil
+        latestScreenPoint = nil; inputNotice = nil
+        // This is the explicit selection UI. Never schedule activation after it closes.
+        NSApp.activate(ignoringOtherApps: true)
         for screen in NSScreen.screens {
             let panel = SelectionPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.title = windows.isEmpty ? "选择截图区域" : "选择截图窗口"
             panel.level = .screenSaver
             panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            panel.isReleasedWhenClosed = false; panel.acceptsMouseMovedEvents = true
+            panel.isReleasedWhenClosed = false; panel.acceptsMouseMovedEvents = true; panel.hidesOnDeactivate = false
             let view = SelectionCanvas(frame: CGRect(origin: .zero, size: screen.frame.size))
             view.selectionOwner = self; view.screenFrame = screen.frame
             panel.contentView = view; panels.append(panel)
-            panel.orderFrontRegardless()
+            panel.orderFrontRegardless(); panel.makeFirstResponder(view)
         }
         // Local event monitoring belongs only to this explicit selection session, not a global shortcut listener.
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            guard let self else { return event }
+            guard let self, let eventWindow = event.window ?? NSApp.keyWindow,
+                  self.panels.contains(where: { $0 === eventWindow }) else { return event }
             return self.handleKey(event) ? nil : event
         }
         panels.first?.makeKey()
+        record(.presented)
     }
 
     fileprivate func down(at point: CGPoint) {
-        latestScreenPoint = point
+        latestScreenPoint = point; inputNotice = nil
+        record(.mouseDown, selectedWindowID: windowAtPointer()?.id)
         if !highlightedWindows.isEmpty {
             if let id = windowAtPointer()?.id { finish(window: id) }
+            else { inputNotice = "未选中可捕获窗口。请移动到目标窗口后重试，或点击“取消选择”。"; record(.windowMiss); redraw() }
             return
         }
         dragOrigin = point
@@ -100,6 +115,7 @@ final class CaptureSelectionController {
     fileprivate func drag(at point: CGPoint) {
         latestScreenPoint = point
         guard let origin = dragOrigin else { return }
+        inputNotice = nil
         selection = CaptureSelectionGeometry.selectionRect(from: origin, to: point)
         redraw()
     }
@@ -111,12 +127,14 @@ final class CaptureSelectionController {
         redraw()
     }
 
-    fileprivate func move(at point: CGPoint) { latestScreenPoint = point; if !highlightedWindows.isEmpty { redraw() } }
+    fileprivate func move(at point: CGPoint) { latestScreenPoint = point; if !highlightedWindows.isEmpty { if windowAtPointer() != nil { inputNotice = nil }; redraw() } }
     fileprivate func confirm(at point: CGPoint? = nil) {
         if let point { latestScreenPoint = point }
         if windowPicked != nil {
             if let id = windowAtPointer()?.id { finish(window: id) }
+            else { inputNotice = "未选中可捕获窗口。请移动到目标窗口后重试，或点击“取消选择”。"; record(.windowMiss); redraw() }
         } else if selection.width >= 1, selection.height >= 1 { finish(cancelled: false) }
+        else { inputNotice = "请先拖出截图区域，再按 Return 确认；也可点击“取消选择”。"; record(.invalidRegion); redraw() }
     }
 
     private func windowAtPointer() -> CaptureWindow? {
@@ -131,6 +149,7 @@ final class CaptureSelectionController {
     }
 
     fileprivate var selectionLabel: String {
+        if let inputNotice { return inputNotice }
         if let window = windowAtPointer(), !highlightedWindows.isEmpty { return "\(window.applicationName) · \(window.title)\n单击或 Return 选择 · Esc 取消" }
         if !highlightedWindows.isEmpty { return "此处没有可确认前后顺序的窗口\n移动到目标窗口 · Esc 取消" }
         let desktop = CaptureGeometry.appKitToDesktop(selection, mainDisplayTop: mainTop)
@@ -143,8 +162,10 @@ final class CaptureSelectionController {
         return "\(Int(selection.width)) × \(Int(selection.height)) 点 · (\(Int(desktop.minX)), \(Int(desktop.minY)))\n\(pixels)\n方向键移动 · Option+方向键调尺寸 · Shift 10点 · Return 确认 · Esc 取消"
     }
 
-    private func handleKey(_ event: NSEvent) -> Bool {
-        if event.keyCode == 53 { cancel(); return true }
+    fileprivate func handleKey(_ event: NSEvent) -> Bool {
+        guard isSelecting else { return false }
+        if [UInt16(53), 36, 76, 123, 124, 125, 126].contains(event.keyCode) { record(.controlKey, keyCode: Int(event.keyCode)) }
+        if event.keyCode == 53 { finish(cancelled: true, cancelSource: 3); return true }
         if event.keyCode == 36 || event.keyCode == 76 { confirm(); return true }
         guard highlightedWindows.isEmpty, selection.width >= 1, selection.height >= 1 else { return false }
         let delta: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1
@@ -161,14 +182,25 @@ final class CaptureSelectionController {
 
     private func redraw() { panels.forEach { $0.contentView?.needsDisplay = true } }
 
-    private func finish(cancelled: Bool = false, window: CGWindowID? = nil) {
+    private func record(_ event: InputEvent, keyCode: Int = -1, selectedWindowID: CGWindowID? = nil, cancelSource: Int = -1) {
+        guard isSelecting else { return }
+        let panel = panels.first(where: { $0.isKeyWindow }) ?? panels.first
+        let phase = windowPicked != nil ? 1 : 2
+        // Numeric diagnostics only: no window titles, typed text, clipboard or image content.
+        let values = "event=\(event.rawValue) phase=\(phase) panel=\(panel?.windowNumber ?? -1) keyWindow=\(NSApp.keyWindow?.windowNumber ?? -1) isKey=\(panel?.isKeyWindow == true ? 1 : 0) appActive=\(NSApp.isActive ? 1 : 0) keyCode=\(keyCode) selectedWindowID=\(selectedWindowID ?? 0) width=\(Int(selection.width.rounded())) height=\(Int(selection.height.rounded())) cancelSource=\(cancelSource)"
+        Logger(subsystem: "com.gaoseries.GaoJieTu", category: "CaptureSelectionInput").notice("\(values, privacy: .public)")
+    }
+
+    private func finish(cancelled: Bool = false, window: CGWindowID? = nil, cancelSource: Int = 0) {
         let selected = selection
+        record(cancelled ? .cancelled : .finished, selectedWindowID: window, cancelSource: cancelled ? cancelSource : -1)
         if let localMonitor { NSEvent.removeMonitor(localMonitor); self.localMonitor = nil }
         for panel in panels { panel.orderOut(nil); panel.close() }
-        panels.removeAll(); dragOrigin = nil; highlightedWindows.removeAll(); latestScreenPoint = nil
-        if let callback = windowPicked { windowPicked = nil; callback(cancelled ? nil : window) }
-        if let completion = continuation {
-            continuation = nil
+        panels.removeAll(); dragOrigin = nil; highlightedWindows.removeAll(); latestScreenPoint = nil; inputNotice = nil
+        let callback = windowPicked, completion = continuation
+        windowPicked = nil; continuation = nil
+        callback?(cancelled ? nil : window)
+        if let completion {
             let ids = NSScreen.screens.filter { $0.frame.intersects(selected) }.compactMap(CaptureGeometry.displayID)
             completion.resume(returning: cancelled || selected.width < 1 || selected.height < 1 ? nil : CaptureRegionSelection(desktopRect: CaptureGeometry.appKitToDesktop(selected, mainDisplayTop: mainTop), displayIDs: ids))
         }
@@ -185,6 +217,21 @@ private final class SelectionCanvas: NSView {
     var screenFrame: CGRect = .zero
     private var tracking: NSTrackingArea?
     override var acceptsFirstResponder: Bool { true }
+    override var needsPanelToBecomeKey: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override init(frame frameRect: NSRect) { super.init(frame: frameRect); addCancelButton() }
+    required init?(coder: NSCoder) { super.init(coder: coder); addCancelButton() }
+    private func addCancelButton() {
+        let button = NSButton(title: "取消选择", target: self, action: #selector(cancelSelection(_:)))
+        button.bezelStyle = .rounded; button.keyEquivalent = "\u{1b}"; button.keyEquivalentModifierMask = []; button.translatesAutoresizingMaskIntoConstraints = false
+        button.setAccessibilityIdentifier("capture.selection.cancel")
+        button.setAccessibilityHelp("取消本次截图选择，返回工作台。")
+        addSubview(button)
+        NSLayoutConstraint.activate([button.topAnchor.constraint(equalTo: topAnchor, constant: 20), button.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -20)])
+    }
+    @objc private func cancelSelection(_ sender: Any?) { selectionOwner?.cancelFromButton() }
+    override func keyDown(with event: NSEvent) { if selectionOwner?.handleKey(event) != true { super.keyDown(with: event) } }
+    override func cancelOperation(_ sender: Any?) { selectionOwner?.cancelFromResponder() }
     override func updateTrackingAreas() {
         if let tracking { removeTrackingArea(tracking) }
         let area = NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseMoved, .inVisibleRect], owner: self, userInfo: nil)
