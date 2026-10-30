@@ -43,7 +43,7 @@ import Combine
     }
     func application(_ application:NSApplication,open urls:[URL]){Task{await AppModel.shared.receive(urls)}}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
-        if [.recording,.paused,.preparing,.stopping].contains(AppModel.shared.recording.state) || AppModel.shared.ocr.isRunning || AppModel.shared.exchange.isExecuting || AppModel.shared.busy{AppModel.shared.message="正在处理，请先停止录制或取消 OCR 后退出。";AppModel.shared.showMain();return .terminateCancel};try? FileManager.default.removeItem(at:AppModel.shared.sessionTemporaryDirectory);return .terminateNow
+        if [.recording,.paused,.preparing,.stopping].contains(AppModel.shared.recording.state) || AppModel.shared.ocr.isRunning || AppModel.shared.exchange.isExecuting || AppModel.shared.busy{AppModel.shared.message="正在处理，请先停止录制或取消当前任务后退出。";AppModel.shared.showMain();return .terminateCancel};try? FileManager.default.removeItem(at:AppModel.shared.sessionTemporaryDirectory);return .terminateNow
     }
     @objc func translateSelection(_ pasteboard:NSPasteboard,userData:String?,error:AutoreleasingUnsafeMutablePointer<NSString?>) {
         guard let text=pasteboard.string(forType:.string),!text.isEmpty else{return};AppModel.shared.setTranslationInput(text)
@@ -63,6 +63,8 @@ import Combine
     @Published var exportQuality=0.9;@Published var exportMaximumDimension=0
     let longPanel=LongCapturePanelController()
     var captureTask:Task<Void,Never>?
+    @Published var longCaptureOperation:LongCaptureOperation?
+    var canCancelCaptureWork:Bool { captureTask != nil || longCaptureOperation?.isActive == true }
     var captureCancellation=OCRCancellationToken()
     var choiceContinuation:CheckedContinuation<CaptureSource?,Never>?
     @Published var externalAnnotation:GaoValidatedPackage?;@Published var externalTranslation:GaoValidatedPackage?
@@ -127,7 +129,13 @@ import Combine
             }catch{fail(error)}
         }
     }
-    func cancelCaptureWork(){captureCancellation.cancel();captureTask?.cancel();selection.cancel();if choiceContinuation != nil{choose(nil)}}
+    func cancelCaptureWork(){
+        if let operation=longCaptureOperation {
+            guard finishLongCapture(operation,cleanup:{selection.cancel();longPanel.cancel()}) else{return}
+            message="已取消长截图。";showMain();return
+        }
+        captureCancellation.cancel();captureTask?.cancel();selection.cancel();if choiceContinuation != nil{choose(nil)}
+    }
     func captureWindow(){captureAction("capture.window")}
     func captureDisplay(){captureAction("capture.display")}
     func captureAction(_ action:String){guard !busy,!exchange.isExecuting,externalAnnotation==nil else{return};busy=true;captureTask=Task{defer{busy=false;captureTask=nil};do{if let frame=try await performCapture(action){try Task.checkCancellation();try adopt(frame)}else{message="已取消。";showMain()}}catch{fail(error)}}}

@@ -5,6 +5,8 @@ import AppKit
 final class LongCapturePanelController: NSObject, NSWindowDelegate {
     private var panel: LongCapturePanel?
     private var service: CaptureService?
+    private var selection: CaptureSelectionController?
+    private var operation: LongCaptureOperation?
     private var session: LongScreenshotSession?
     private var source: CaptureSource?
     private var options = CaptureOptions()
@@ -26,24 +28,28 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
     var onStatus: ((String) -> Void)?
     var onCancel: (() -> Void)?
 
-    func start(service: CaptureService, selection: CaptureSelectionController, options: CaptureOptions = .init(), onComplete: @escaping (CGImage) -> Void) async throws {
+    func start(service: CaptureService, selection: CaptureSelectionController, operation: LongCaptureOperation, options: CaptureOptions = .init(), onComplete: @escaping (CGImage) -> Void) async throws {
+        try operation.checkActive()
         cancelSession(notify: false)
+        self.operation = operation; self.selection = selection
         onStatus?("长截图：先单击目标窗口，再拖选其中的纯滚动内容区；排除固定页眉、页脚和侧栏。")
-        let catalog = try await service.refreshCatalog()
-        guard let id = await selection.selectWindow(from: catalog.windows), let window = catalog.windows.first(where: { $0.id == id }) else { throw CaptureFailure.cancelled }
-        onStatus?("长截图：拖选目标窗口内的滚动内容区，Return 确认。")
-        guard let region = await selection.selectRegion() else { throw CaptureFailure.cancelled }
-        guard let display = catalog.displays.first(where: { $0.frame.contains(region.desktopRect) }),
-              window.frame.insetBy(dx: -1, dy: -1).contains(region.desktopRect) else {
-            throw CaptureFailure.unsupported("长截图内容区须完整位于所选窗口与一块显示器内，请重新选择。跨屏普通截图仍可使用。")
-        }
+        let prepared = try await LongCapturePreparation.run(operation: operation,
+            isCurrent: { [weak self] in self?.operation === operation },
+            refreshCatalog: { try await service.refreshCatalog() },
+            selectWindow: { await selection.selectWindow(from: $0) },
+            willSelectRegion: { [weak self] in self?.onStatus?("长截图：拖选目标窗口内的滚动内容区，Return 确认。") },
+            selectRegion: { await selection.selectRegion()?.desktopRect },
+            activate: { window in
+                // Explicitly selected product target, activated once. Subsequent controls never steal its focus.
+                guard let app = NSRunningApplication(processIdentifier: window.processID), app.activate(options: []) else { throw CaptureFailure.sourceMissing }
+            },
+            settle: { try await Task.sleep(nanoseconds: 350_000_000) })
+        try operation.checkActive()
+        guard self.operation === operation else { throw CancellationError() }
+        let window = prepared.window, display = prepared.display, region = prepared.region
         self.service = service; self.options = options; self.completion = onComplete
-        self.source = .region(displayID: display.id, rectInDisplayPoints: region.desktopRect.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY))
-        self.session = LongScreenshotSession(target: ScrollTargetIdentity(processID: window.processID, windowID: window.id, frame: window.frame, scrollRegion: region.desktopRect))
-        // Explicitly selected product target, activated once. Subsequent controls never steal its focus.
-        guard let app = NSRunningApplication(processIdentifier: window.processID), app.activate(options: []) else { throw CaptureFailure.sourceMissing }
-        try await Task.sleep(nanoseconds: 350_000_000)
-        try Task.checkCancellation()
+        self.source = .region(displayID: display.id, rectInDisplayPoints: region.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY))
+        self.session = LongScreenshotSession(target: ScrollTargetIdentity(processID: window.processID, windowID: window.id, frame: window.frame, scrollRegion: region))
         buildPanel(targetName: window.applicationName)
         captureNext(scroll: false)
     }
@@ -89,7 +95,7 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
     }
 
     private func captureNext(scroll: Bool) {
-        guard !busy, let service, let source, let session else { return }
+        guard !busy, let service, let source, let session, let operation, operation.isActive else { return }
         busy = true; updateButtons(); status.stringValue = scroll ? "向目标窗口发送一次滚动并等待画面稳定…" : "正在捕获当前帧…"
         captureTask = Task { [weak self] in
             guard let self else { return }
@@ -97,12 +103,12 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
                 let seam: ScrollSeamEstimate?
                 if scroll { seam = try await session.scrollAndCapture(using: service, source: source, options: self.options) }
                 else { seam = try await session.captureNext(using: service, source: source, options: self.options) }
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, operation.isActive, self.operation === operation else { return }
                 if let pending = session.pendingSeam { self.showSeam(pending) }
                 else if seam?.duplicate == true { self.status.stringValue = "画面没有移动，当前帧未追加。可能已到边界，可完成或手动滚动后重试。" }
                 else { self.status.stringValue = "已捕获 \(session.capturedFrameCount) 帧 · 高度 \(session.outputHeight) px · 估计峰值 \(session.estimatedPeakMemoryBytes / 1024 / 1024) MiB。请滚动后捕获下一帧，或完成。" }
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, operation.isActive, self.operation === operation else { return }
                 self.status.stringValue = error.localizedDescription
             }
             self.busy = false; self.captureTask = nil; self.updateButtons()
@@ -141,17 +147,22 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
     @objc private func rejectSeam() { session?.rejectPending(); previewStack?.isHidden = true; status.stringValue = "已拒绝接缝。请回到目标窗口调整滚动位置，再点下一帧。"; updateButtons() }
     @objc private func finishCapture() {
         do {
+            guard let operation, operation.isActive else { return }
             guard let image = try session?.finish() else { return }
             let completion = self.completion; self.completion = nil
-            closePanel(); service = nil; session = nil; source = nil
+            closePanel(); service = nil; session = nil; source = nil; selection = nil; self.operation = nil
+            clearPreviews()
             completion?(image)
         } catch { status.stringValue = error.localizedDescription }
     }
     @objc private func cancelCapture() { cancel() }
     private func closePanel() { panel?.delegate = nil; panel?.orderOut(nil); panel?.close(); panel = nil }
+    private func clearPreviews() { previousPreview.image = nil; currentPreview.image = nil; previewStack?.isHidden = true }
     private func cancelSession(notify: Bool) {
+        operation = nil
+        selection?.cancel(); selection = nil
         captureTask?.cancel(); captureTask = nil; session?.cancel(); session = nil; service = nil; source = nil; completion = nil; busy = false
-        closePanel(); if notify { onCancel?() }
+        closePanel(); clearPreviews(); if notify { onCancel?() }
     }
 }
 
