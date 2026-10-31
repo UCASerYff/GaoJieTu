@@ -25,7 +25,7 @@ spec.loader.exec_module(backup_module)
 
 class BackupTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='GaoJieTu-BackupTests-', dir='/private/tmp')
+        self.temporary = tempfile.TemporaryDirectory(prefix='GaoJieTu-BackupTests-', suffix='.noindex', dir='/private/tmp')
         self.base = pathlib.Path(self.temporary.name)
         self.root = self.base / 'GaoJieTu'
         self.root.mkdir(mode=0o700)
@@ -320,7 +320,7 @@ class BackupTests(unittest.TestCase):
                 'CFBundleShortVersionString': version, 'CFBundleVersion': '1', 'CFBundleExecutable': 'GaoJieTu'}))
             (path / 'Contents/MacOS/GaoJieTu').write_bytes(b'self-generated mock app, never executed')
         app(target, '1.01', current_bundle)
-        backup = self.base / 'GaoJieTu-Backups/Backup-rollback-test'
+        backup = self.base / 'GaoJieTu-Backups/Backup-rollback-test.noindex'
         with contextlib.redirect_stdout(io.StringIO()):
             backup_module.backup(self.root, backup)
         if previous:
@@ -335,12 +335,15 @@ class BackupTests(unittest.TestCase):
         program = program.replace("DATA = pathlib.Path.home() / 'Library/Application Support/GaoSeries/GaoJieTu'", 'DATA = pathlib.Path(' + repr(str(self.root)) + ')')
         return program, target, backup
 
-    def execute_isolated_rollback(self, program, *, bad_current_signature=False, target=None):
+    def execute_isolated_rollback(self, program, *, bad_current_signature=False, target=None, ditto_hook=None):
         calls = []
         def run(args, **kwargs):
             calls.append(args)
             if args[0] == '/usr/bin/ditto':
-                shutil.copytree(args[1], args[2])
+                if ditto_hook is not None:
+                    ditto_hook(pathlib.Path(args[1]), pathlib.Path(args[2]))
+                else:
+                    shutil.copytree(args[1], args[2], dirs_exist_ok=True)
             code = 1 if bad_current_signature and args[0] == '/usr/bin/codesign' and args[-1] == str(target) else 0
             return subprocess.CompletedProcess(args, code, stdout=b'', stderr=b'')
         output, errors = io.StringIO(), io.StringIO()
@@ -352,7 +355,7 @@ class BackupTests(unittest.TestCase):
     def test_rollback_preserves_failed_app_and_restores_old_bundle_without_data_changes(self):
         program, target, backup = self.prepare_rollback()
         before = backup_module.inventory(self.root)
-        self.execute_isolated_rollback(program)
+        calls = self.execute_isolated_rollback(program)
         info = plistlib.loads((target / 'Contents/Info.plist').read_bytes())
         self.assertEqual(info['CFBundleShortVersionString'], '1.00')
         failed = list(backup.glob('FailedNewRollback-*.app'))
@@ -360,6 +363,71 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(plistlib.loads((failed[0] / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString'], '1.01')
         self.assertTrue((backup / 'PreviousInstalled.app').exists())
         self.assertEqual(before, backup_module.inventory(self.root))
+        stage = pathlib.Path(next(args[2] for args in calls if args[0] == '/usr/bin/ditto'))
+        self.assertEqual(stage.name, '搞截图.app')
+        self.assertTrue(stage.parent.name.endswith('.noindex'))
+        self.assertEqual(stage.parent.parent, target.parent)
+        self.assertFalse(stage.parent.exists())
+
+    def test_rollback_partial_stage_copy_failure_keeps_current_and_backups(self):
+        program, target, backup = self.prepare_rollback()
+        before_data = backup_module.inventory(self.root)
+        before_backup = backup_module.inventory(backup)
+        observed = []
+        sibling = target.parent / 'unrelated-marker'
+        sibling.write_bytes(b'preserve sibling')
+        def partial_copy(source, destination):
+            self.assertTrue(destination.is_dir())
+            self.assertTrue(destination.parent.name.endswith('.noindex'))
+            observed.append(destination)
+            (destination / 'partial-copy').write_bytes(b'incomplete self-generated App')
+            raise subprocess.CalledProcessError(1, ['/usr/bin/ditto'])
+        with self.assertRaises(SystemExit) as failure:
+            self.execute_isolated_rollback(program, ditto_hook=partial_copy)
+        self.assertEqual(failure.exception.code, 1)
+        self.assertEqual(len(observed), 1)
+        self.assertFalse(observed[0].parent.exists())
+        self.assertEqual(plistlib.loads((target / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString'], '1.01')
+        self.assertEqual(before_data, backup_module.inventory(self.root))
+        self.assertEqual(before_backup, backup_module.inventory(backup))
+        self.assertEqual(sibling.read_bytes(), b'preserve sibling')
+
+    def test_rollback_stage_collision_does_not_remove_preexisting_container(self):
+        program, target, backup = self.prepare_rollback()
+        fixed_uuid = uuid.UUID('12345678-1234-5678-1234-567812345678')
+        container = target.parent / ('.GaoJieTu-rollback-' + fixed_uuid.hex + '.noindex')
+        container.mkdir(mode=0o700)
+        marker = container / 'preexisting-marker'
+        marker.write_bytes(b'preserve unknown container')
+        before_backup = backup_module.inventory(backup)
+        with mock.patch('uuid.uuid4', return_value=fixed_uuid):
+            with self.assertRaises(SystemExit) as failure:
+                self.execute_isolated_rollback(program)
+        self.assertEqual(failure.exception.code, 1)
+        self.assertEqual(marker.read_bytes(), b'preserve unknown container')
+        self.assertEqual(before_backup, backup_module.inventory(backup))
+        self.assertEqual(plistlib.loads((target / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString'], '1.01')
+
+    def test_rollback_stage_identity_change_does_not_remove_unknown_target(self):
+        program, target, backup = self.prepare_rollback()
+        unrelated = self.base / 'Unrelated'
+        unrelated.mkdir()
+        marker = unrelated / 'preserve'
+        marker.write_bytes(b'preserve unknown target')
+        observed = []
+        def replace_stage(source, destination):
+            observed.append(destination)
+            destination.rename(destination.with_name('DisplacedOwned.app'))
+            destination.symlink_to(unrelated, target_is_directory=True)
+            raise subprocess.CalledProcessError(1, ['/usr/bin/ditto'])
+        with self.assertRaises(SystemExit) as failure:
+            self.execute_isolated_rollback(program, ditto_hook=replace_stage)
+        self.assertEqual(failure.exception.code, 1)
+        self.assertTrue(observed[0].is_symlink())
+        self.assertTrue(observed[0].with_name('DisplacedOwned.app').is_dir())
+        self.assertEqual(marker.read_bytes(), b'preserve unknown target')
+        self.assertTrue((backup / 'PreviousInstalled.app').is_dir())
+        self.assertEqual(plistlib.loads((target / 'Contents/Info.plist').read_bytes())['CFBundleShortVersionString'], '1.01')
 
     def test_first_install_rollback_withdraws_only_own_app_and_keeps_data(self):
         program, target, backup = self.prepare_rollback(previous=False)

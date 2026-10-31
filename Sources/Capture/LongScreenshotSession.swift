@@ -165,9 +165,10 @@ final class LongScreenshotSession {
         guard let target else { throw CaptureFailure.unsupported("自动滚动需要明确的目标窗口；无目标时请手动滚动。") }
         guard AXIsProcessTrusted() else { throw CaptureFailure.unsupported("辅助功能权限未授权，仍可使用手动滚动逐帧拼接。") }
         return try await scrollAndCapture(downwardPoints: downwardPoints, performScroll: { anchor in
-            guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: -downwardPoints, wheel2: 0, wheel3: 0) else { throw CaptureFailure.sourceMissing }
-            event.location = anchor
-            event.postToPid(target.processID)
+            guard let windowIdentity = self.targetGuard?.boundAccessibilityIdentity else { throw CaptureFailure.sourceMissing }
+            try ScrollAccessibilityAction.pageDown(target: target, anchor: anchor, windowIdentity: windowIdentity) {
+                _ = try self.validateCurrentTarget(stage: .preScroll)
+            }
             try await Task.sleep(nanoseconds: 450_000_000)
         }, capturing: { try await service.capture(source, options: options).image })
     }

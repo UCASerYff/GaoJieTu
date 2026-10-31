@@ -106,6 +106,7 @@ final class ScrollTargetGuard {
     private let target: ScrollTargetIdentity
     private var initialFrame: CGRect?
     private var focusedIdentity: ScrollFocusIdentity?
+    var boundAccessibilityIdentity: ScrollFocusIdentity? { focusedIdentity }
 
     init(target: ScrollTargetIdentity) { self.target = target; initialFrame = target.frame }
 
@@ -217,5 +218,93 @@ final class LiveScrollTargetProbe: ScrollTargetProbing {
               CFEqual(focused, focusAfterGeometry) else { return .accessibilityQueryFailed }
         // AXPosition and AXSize use global desktop points with a top-left origin, just like CG bounds.
         return .accessibility(processID: pid, frame: CGRect(origin: point, size: dimensions), identity: ScrollFocusIdentity(element: focused))
+    }
+}
+
+@MainActor
+enum ScrollAccessibilityAction {
+    /// One page action advertised by the original ROI's scroll area.
+    /// The source app defines the page size; no pixel distance or overlap is promised.
+    static func pageDown(target: ScrollTargetIdentity, anchor: CGPoint,
+                         windowIdentity: ScrollFocusIdentity, revalidate: () throws -> Void) throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        let app = AXUIElementCreateApplication(target.processID)
+        let action = "AXScrollDownByPage" as CFString
+        let unavailable = CaptureFailure.unsupported("此滚动区域没有可核验的向下翻页动作，请手动滚动后捕获下一帧。")
+        func prepare(_ element: AXUIElement) throws {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            var pid: pid_t = 0
+            guard remaining > 0, AXUIElementSetMessagingTimeout(element, Float(min(0.2, remaining))) == .success,
+                  AXUIElementGetPid(element, &pid) == .success, pid == target.processID else { throw unavailable }
+        }
+        func value(_ element: AXUIElement, _ name: CFString) throws -> CFTypeRef {
+            try prepare(element)
+            var raw: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, name, &raw) == .success, let raw else { throw unavailable }
+            return raw
+        }
+        func elementValue(_ element: AXUIElement, _ name: CFString) throws -> AXUIElement {
+            let raw = try value(element, name)
+            guard CFGetTypeID(raw) == AXUIElementGetTypeID() else { throw unavailable }
+            return raw as! AXUIElement
+        }
+        func sameWindow(_ element: AXUIElement) throws {
+            let window = try elementValue(element, kAXWindowAttribute as CFString)
+            let topLevel = try elementValue(element, kAXTopLevelUIElementAttribute as CFString)
+            try prepare(window); try prepare(topLevel)
+            guard ScrollFocusIdentity(element: window) == windowIdentity,
+                  ScrollFocusIdentity(element: topLevel) == windowIdentity else { throw unavailable }
+        }
+        func frame(_ element: AXUIElement) throws -> CGRect {
+            let rawPosition = try value(element, kAXPositionAttribute as CFString)
+            let rawSize = try value(element, kAXSizeAttribute as CFString)
+            guard CFGetTypeID(rawPosition) == AXValueGetTypeID(), CFGetTypeID(rawSize) == AXValueGetTypeID() else { throw unavailable }
+            let position = rawPosition as! AXValue, dimensions = rawSize as! AXValue
+            var point = CGPoint.zero, size = CGSize.zero
+            guard AXValueGetType(position) == .cgPoint, AXValueGetType(dimensions) == .cgSize,
+                  AXValueGetValue(position, .cgPoint, &point), AXValueGetValue(dimensions, .cgSize, &size) else { throw unavailable }
+            let rect = CGRect(origin: point, size: size)
+            guard CaptureWindowEligibility.validFrame(rect) else { throw unavailable }
+            return rect
+        }
+        func resolve() throws -> (area: AXUIElement, frame: CGRect) {
+            try prepare(app)
+            var hit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(app, Float(anchor.x), Float(anchor.y), &hit) == .success,
+                  var current = hit else { throw unavailable }
+            for _ in 0..<24 {
+                try prepare(current)
+                let role = try value(current, kAXRoleAttribute as CFString) as? String
+                if role == kAXWindowRole as String { throw unavailable }
+                try sameWindow(current)
+                if role == kAXScrollAreaRole as String {
+                    guard let roi = target.scrollRegion else { throw unavailable }
+                    let areaFrame = try frame(current)
+                    // Do not select a larger outer area when the nearest one does not contain the ROI.
+                    guard areaFrame.contains(roi) else { throw unavailable }
+                    var actions: CFArray?
+                    try prepare(current)
+                    guard AXUIElementCopyActionNames(current, &actions) == .success,
+                          let names = actions as? [String], names.contains(action as String) else { throw unavailable }
+                    return (current, areaFrame)
+                }
+                current = try elementValue(current, kAXParentAttribute as CFString)
+            }
+            throw unavailable
+        }
+        let original = try resolve()
+        let latest = try resolve()
+        guard CFEqual(original.area, latest.area), original.frame == latest.frame else { throw unavailable }
+        try prepare(latest.area)
+        // Make the unchanged production focus/CG geometry guard the final major read before input.
+        try revalidate()
+        try Task.checkCancellation()
+        guard ProcessInfo.processInfo.systemUptime < deadline,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processID else { throw unavailable }
+        let result = AXUIElementPerformAction(latest.area, action)
+        guard result == .success else {
+            // A timeout can mean the action already ran. Never retry or fall back to a global event.
+            throw CaptureFailure.unsupported("滚动动作结果未确认（AX \(result.rawValue)），未自动重试；请核对原窗口后手动滚动。")
+        }
     }
 }

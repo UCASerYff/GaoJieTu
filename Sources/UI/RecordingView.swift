@@ -53,8 +53,11 @@ struct RecordingView:View {
     var controls:some View {
         HStack {
             Button("开始\(audioOnly ? "录音":"录屏")"){start()}.buttonStyle(.borderedProminent).disabled(active)
+                .accessibilityLabel(audioOnly ? "开始录音":"开始录屏").accessibilityIdentifier("recording.start")
             Button(controller.state == .paused ? "继续":"暂停"){if controller.state == .paused{controller.resume()}else{controller.pause()}}.disabled(![.recording,.paused].contains(controller.state))
+                .accessibilityLabel(controller.state == .paused ? "继续":"暂停").accessibilityIdentifier("recording.pauseResume")
             Button("停止并完成"){Task{await controller.stop()}}.disabled(![.recording,.paused].contains(controller.state))
+                .accessibilityLabel("停止并完成").accessibilityIdentifier("recording.stop")
             Button("取消并保留恢复材料"){Task{await controller.cancel()}}.disabled(![.recording,.paused].contains(controller.state))
         }
     }

@@ -176,16 +176,23 @@ try:
     if verify_only:
         print('回滚预检通过：' + ('可恢复已签名旧程序。' if had_previous else '确认为首次安装；执行时仅撤下失败新程序并保留其备份。'))
         sys.exit(0)
-    stage = TARGET.parent / ('.GaoJieTu-rollback-' + uuid.uuid4().hex + '.app')
+    stage_container = TARGET.parent / ('.GaoJieTu-rollback-' + uuid.uuid4().hex + '.noindex')
+    stage = stage_container / '搞截图.app'
     failed = backup / ('FailedNewRollback-' + uuid.uuid4().hex + '.app')
-    require(exists(stage) is None and exists(failed) is None, '回滚暂存路径冲突')
-    staged = False
+    require(exists(failed) is None, '回滚备份路径冲突')
+    container_identity = None
+    stage_identity = None
     moved_current = False
     try:
         if had_previous:
-            # Keep the old backup intact; stage and verify a separate copy before touching the current installation.
+            # Create the non-indexed container before any App; retain the original old backup intact.
+            os.mkdir(stage_container, 0o700)
+            entry = stage_container.lstat()
+            container_identity = (entry.st_dev, entry.st_ino)
+            os.mkdir(stage, 0o700)
+            entry = stage.lstat()
+            stage_identity = (entry.st_dev, entry.st_ino)
             subprocess.run(['/usr/bin/ditto', str(old), str(stage)], check=True, capture_output=True)
-            staged = True
             verify_bundle(stage)
         if current_exists:
             require(unregister(TARGET), '无法精确注销本应用当前路径；尚未撤下程序')
@@ -199,7 +206,7 @@ try:
             require(exists(TARGET) is None, '回滚目标被其他进程创建，停止覆盖')
             try:
                 os.rename(stage, TARGET)
-                staged = False
+                stage_identity = None
                 verify_bundle(TARGET)
             except BaseException:
                 # Only restore the failed app when the target is absent; never overwrite an unknown concurrent bundle.
@@ -227,9 +234,22 @@ try:
             print('旧程序已恢复，但精确系统登记失败；请核验本应用登记。', file=sys.stderr)
             sys.exit(1)
     finally:
-        if staged and exists(stage) is not None:
-            # This random stage was created by this invocation; the original old backup remains preserved.
-            shutil.rmtree(stage)
+        if container_identity is not None:
+            entry = exists(stage_container)
+            require(entry is not None and stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode) and
+                    entry.st_uid == os.getuid() and (entry.st_dev, entry.st_ino) == container_identity,
+                    '回滚暂存容器身份发生变化，未清理未知对象')
+            if stage_identity is not None:
+                entry = exists(stage)
+                require(entry is not None and stat.S_ISDIR(entry.st_mode) and not stat.S_ISLNK(entry.st_mode) and
+                        entry.st_uid == os.getuid() and (entry.st_dev, entry.st_ino) == stage_identity,
+                        '回滚暂存程序身份发生变化，未清理未知对象')
+                # Also removes a partial ditto copy; only this invocation's exact owned App is removed.
+                shutil.rmtree(stage)
+            try:
+                stage_container.rmdir()
+            except OSError:
+                print('非空或不可移除的回滚暂存容器已保留待核验：' + str(stage_container), file=sys.stderr)
 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
     print('回滚已停止：' + str(error) + '。用户资料和安全备份未清理。', file=sys.stderr)
     sys.exit(1)
