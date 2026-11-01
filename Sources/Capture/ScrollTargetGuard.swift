@@ -223,6 +223,41 @@ final class LiveScrollTargetProbe: ScrollTargetProbing {
 
 @MainActor
 enum ScrollAccessibilityAction {
+    /// Failure-only metadata; the last AX return is evidence, not an inferred cause.
+    private struct FailureDiagnostic {
+        enum Stage: Int {
+            case region = 1, originalArea, areaBinding, descendants, marker, choices
+            case beforeInput, performAction, settling, afterInput
+        }
+        enum Operation: Int {
+            case none = 0, deadline, messagingTimeout, processID, attributeValue
+            case attributeCount, attributeSlice, actionNames, hitTest, performAction
+        }
+        var stage = Stage.region
+        var operation = Operation.none
+        var attribute = 0
+        var lastAXResult: Int32 = AXError.success.rawValue
+        var visited = 0, skipped = 0, content = 0, choices = 0
+        var actionAttempted = false, actionSucceeded = false
+
+        mutating func observed(_ result: AXError, _ operation: Operation, _ name: CFString? = nil) -> AXError {
+            self.operation = operation
+            // Codes are fixed metadata names; never log an AX value, title, or description.
+            let attributes = [kAXRoleAttribute, kAXWindowAttribute, kAXTopLevelUIElementAttribute,
+                              kAXPositionAttribute, kAXSizeAttribute, kAXParentAttribute,
+                              kAXIndexAttribute, kAXChildrenAttribute, kAXVisibleChildrenAttribute]
+            attribute = name.flatMap { attributes.firstIndex(of: $0 as String) }.map { $0 + 1 } ?? 0
+            lastAXResult = result.rawValue
+            return result
+        }
+
+        func recordFailure() {
+            #if !SCROLL_TARGET_GUARD_TESTS
+            Logger(subsystem: "com.gaoseries.GaoJieTu", category: "LongCaptureScroll").error("stage=\(stage.rawValue, privacy: .public) operation=\(operation.rawValue, privacy: .public) attribute=\(attribute, privacy: .public) lastAXResult=\(lastAXResult, privacy: .public) visited=\(visited, privacy: .public) skipped=\(skipped, privacy: .public) content=\(content, privacy: .public) choices=\(choices, privacy: .public) actionAttempted=\(actionAttempted, privacy: .public) actionSucceeded=\(actionSucceeded, privacy: .public)")
+            #endif
+        }
+    }
+
     /// Session-local ordering hints only. Every hinted reference is checked again before use.
     final class Cursor {
         fileprivate var area: AXUIElement?
@@ -247,6 +282,9 @@ enum ScrollAccessibilityAction {
     @available(macOS 26.0, *)
     private static func scrollToVisible(target: ScrollTargetIdentity, anchor: CGPoint, requestedPoints: CGFloat,
                                         windowIdentity: ScrollFocusIdentity, cursor: Cursor, revalidate: () throws -> Void) async throws {
+        var diagnostic = FailureDiagnostic()
+        var completed = false
+        defer { if !completed { diagnostic.recordFailure() } }
         let transactionDeadline = ProcessInfo.processInfo.systemUptime + 5
         var phaseDeadline = ProcessInfo.processInfo.systemUptime + 2
         let app = AXUIElementCreateApplication(target.processID)
@@ -258,13 +296,15 @@ enum ScrollAccessibilityAction {
             try Task.checkCancellation()
             let remaining = min(phaseDeadline, transactionDeadline) - ProcessInfo.processInfo.systemUptime
             var pid: pid_t = 0
-            guard remaining > 0, AXUIElementSetMessagingTimeout(element, Float(min(0.2, remaining))) == .success,
-                  AXUIElementGetPid(element, &pid) == .success, pid == target.processID else { throw unavailable }
+            guard remaining > 0 else { diagnostic.operation = .deadline; diagnostic.attribute = 0; throw unavailable }
+            guard diagnostic.observed(AXUIElementSetMessagingTimeout(element, Float(min(0.2, remaining))), .messagingTimeout) == .success,
+                  diagnostic.observed(AXUIElementGetPid(element, &pid), .processID) == .success,
+                  pid == target.processID else { throw unavailable }
         }
         func optionalValue(_ element: AXUIElement, _ name: CFString) throws -> CFTypeRef? {
             try prepare(element)
             var raw: CFTypeRef?
-            let result = AXUIElementCopyAttributeValue(element, name, &raw)
+            let result = diagnostic.observed(AXUIElementCopyAttributeValue(element, name, &raw), .attributeValue, name)
             try Task.checkCancellation()
             switch result {
             case .success: return raw
@@ -312,7 +352,7 @@ enum ScrollAccessibilityAction {
         func childCount(_ element: AXUIElement, _ attribute: CFString) throws -> Int {
             try prepare(element)
             var count: CFIndex = 0
-            let result = AXUIElementGetAttributeValueCount(element, attribute, &count)
+            let result = diagnostic.observed(AXUIElementGetAttributeValueCount(element, attribute, &count), .attributeCount, attribute)
             if [.attributeUnsupported, .noValue, .notImplemented].contains(result) { return 0 }
             guard result == .success, count >= 0 else { throw unavailable }
             return count
@@ -322,7 +362,7 @@ enum ScrollAccessibilityAction {
             guard start >= 0, start < count else { return [] }
             var raw: CFArray?
             try prepare(element)
-            guard AXUIElementCopyAttributeValues(element, attribute, start, min(maximum, count - start), &raw) == .success,
+            guard diagnostic.observed(AXUIElementCopyAttributeValues(element, attribute, start, min(maximum, count - start), &raw), .attributeSlice, attribute) == .success,
                   let items = raw as? [AXUIElement], items.count <= maximum else { throw unavailable }
             return items
         }
@@ -373,7 +413,7 @@ enum ScrollAccessibilityAction {
         func advertisesAction(_ element: AXUIElement) throws -> Bool {
             try prepare(element)
             var raw: CFArray?
-            let result = AXUIElementCopyActionNames(element, &raw)
+            let result = diagnostic.observed(AXUIElementCopyActionNames(element, &raw), .actionNames)
             if [.attributeUnsupported, .noValue, .notImplemented].contains(result) { return false }
             guard result == .success, let names = raw as? [String] else { throw unavailable }
             return names.contains(action as String)
@@ -382,7 +422,7 @@ enum ScrollAccessibilityAction {
         func resolveArea() throws -> (area: AXUIElement, frame: CGRect, ancestors: [Node], parents: [ParentPair]) {
             try prepare(app)
             var hit: AXUIElement?
-            guard AXUIElementCopyElementAtPosition(app, Float(anchor.x), Float(anchor.y), &hit) == .success,
+            guard diagnostic.observed(AXUIElementCopyElementAtPosition(app, Float(anchor.x), Float(anchor.y), &hit), .hitTest) == .success,
                   var current = hit else { throw unavailable }
             var ancestors: [Node] = []
             var parents: [ParentPair] = []
@@ -416,7 +456,9 @@ enum ScrollAccessibilityAction {
             throw unavailable
         }
 
+        diagnostic.stage = .originalArea
         let original = try resolveArea()
+        diagnostic.stage = .areaBinding
         if let boundArea = cursor.area {
             guard CFEqual(boundArea, original.area), cursor.areaFrame == original.frame else { throw unavailable }
         } else {
@@ -425,6 +467,7 @@ enum ScrollAccessibilityAction {
         anchorParents = original.parents
         var nodes = original.ancestors
         var seen: [AXUIElement] = []
+        diagnostic.stage = .descendants
         var queue = try limitedChildren(original.area).map { (element: $0, depth: 1) }
         var visited = 0
         let descendantBudget = max(0, 48 - original.ancestors.count)
@@ -432,9 +475,15 @@ enum ScrollAccessibilityAction {
             let item = queue.removeFirst()
             if seen.contains(where: { CFEqual($0, item.element) }) { continue }
             seen.append(item.element); visited += 1
+            diagnostic.visited = visited
             let itemRole = try role(item.element)
             // A nested scroll area is a separate input target, even within the same window.
             if itemRole == kAXScrollAreaRole as String || itemRole == kAXWindowRole as String { continue }
+            // These controls cannot be content targets; do not require their unrelated window metadata.
+            if itemRole == kAXScrollBarRole as String || itemRole == kAXValueIndicatorRole as String {
+                diagnostic.skipped += 1
+                continue
+            }
             try sameWindow(item.element)
             if !nodes.contains(where: { CFEqual($0.element, item.element) }), let bounds = try frame(item.element) {
                 nodes.append((item.element, bounds, itemRole))
@@ -449,19 +498,25 @@ enum ScrollAccessibilityAction {
             node.role != kAXScrollBarRole as String && node.role != kAXValueIndicatorRole as String
                 && node.frame.minX <= anchor.x && node.frame.maxX >= anchor.x
         }
+        diagnostic.content = content.count
+        diagnostic.stage = .marker
         // Prefer a small visible content element over a stationary clipping container.
         let markers = content.filter { $0.frame.intersects(roi) && $0.frame != original.frame }
             .sorted { $0.frame.height < $1.frame.height }
         guard let marker = markers.first else { throw unavailable }
+        diagnostic.stage = .choices
         var choices: [(node: Node, plan: ScrollVisibilityPlan)] = []
         for node in content where !CFEqual(node.element, marker.element) {
             guard let plan = try? ScrollVisibilityPlan.makePlan(viewport: original.frame, roi: roi,
                                                                marker: marker.frame, target: node.frame,
                                                                requestedPoints: requestedPoints) else { continue }
-            if try advertisesAction(node.element) { choices.append((node, plan)) }
+            if try advertisesAction(node.element) {
+                choices.append((node, plan)); diagnostic.choices = choices.count
+            }
         }
         guard let choice = choices.min(by: { $0.plan.expectedMinimumScroll < $1.plan.expectedMinimumScroll }) else { throw unavailable }
 
+        diagnostic.stage = .beforeInput
         let latest = try resolveArea()
         guard CFEqual(original.area, latest.area), original.frame == latest.frame,
               try frame(marker.element) == marker.frame, try frame(choice.node.element) == choice.node.frame else { throw unavailable }
@@ -474,13 +529,18 @@ enum ScrollAccessibilityAction {
         try Task.checkCancellation()
         guard ProcessInfo.processInfo.systemUptime < min(phaseDeadline, transactionDeadline),
               NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processID else { throw unavailable }
-        let result = AXUIElementPerformAction(choice.node.element, action)
+        diagnostic.stage = .performAction
+        diagnostic.actionAttempted = true
+        let result = diagnostic.observed(AXUIElementPerformAction(choice.node.element, action), .performAction)
         guard result == .success else {
             throw CaptureFailure.unsupported("滚入视口动作结果未确认（AX \(result.rawValue)），未重复发送；请检查原窗口后手动滚动。")
         }
+        diagnostic.actionSucceeded = true
+        diagnostic.stage = .settling
         try await Task.sleep(nanoseconds: 450_000_000)
         try Task.checkCancellation()
         phaseDeadline = min(transactionDeadline, ProcessInfo.processInfo.systemUptime + 2)
+        diagnostic.stage = .afterInput
         do {
             let after = try resolveArea()
             guard CFEqual(original.area, after.area), original.frame == after.frame else { throw unavailable }
@@ -500,6 +560,7 @@ enum ScrollAccessibilityAction {
                 hints.append(edge); current = edge.parent
             }
             cursor.hints = hints
+            completed = true
         } catch is CancellationError {
             throw CancellationError()
         } catch {
