@@ -1,8 +1,14 @@
 # 搞截图
 
-原生 macOS 截图、标注、贴图、录屏/独立录音、GIF、本机 OCR 与翻译工作台。Bundle ID `com.gaoseries.GaoJieTu`，V1.07 / build 8，Apple Silicon，macOS 14+。不采集遥测，不默认保存截图历史，不监听剪贴板或全局划词。
+原生 macOS 截图、标注、贴图、录屏/独立录音、GIF、本机 OCR 与翻译工作台。Bundle ID `com.gaoseries.GaoJieTu`，V1.08 / build 9，Apple Silicon，macOS 14+。不采集遥测，不默认保存截图历史，不监听剪贴板或全局划词。
 
 针对性回归、文件级安装核验与实际操作验收分别记录；编译或生成媒体通过不能替代真实屏幕、声音和系统权限结果。系统授权、采集与语言包下载按用户明确授权操作；实际验收前保留旧程序与回滚材料，正式稳定 Release 在验收通过后发布。
+
+## V1.08 兼容候选
+
+- 自动长截图在 macOS 26+ 使用目标元素实际提供的公开“滚入可见区域”动作。只选择原滚动区内、小步预算覆盖的下方目标；同源两个元素必须实际一致向上移动、不超过所选区域高度的80%，原窗口/焦点/几何仍保持，才捕获和核对接缝。
+- 目标查找限于可见引用、当前锚点附近及上次已验证目标的相邻切片；引用、层级和时间均有上限。元数据不足、动作结果不明、零移动或过度移动时保留已有帧并提示手动滚动，不自动重试或改发全局输入。旧系统可继续手动逐帧捕获。
+- 本候选的真实连续位移、接缝和干净输出尚待安装版验收；纯几何和原目标守卫检查不替代实际输出。
 
 ## V1.07 修正
 
@@ -74,6 +80,8 @@ Scripts/test_recording_targeted.sh # 旧会话回调隔离与生成音频的实�
 python3 Scripts/test_release.py # 发行来源、版本、摘要与安装字节核验的合成测试
 python3 Scripts/test_backup.py  # 备份/回滚边界测试，不操作真实安装
 # Scripts/test.sh 为完整旧回归，含窗口测试；按需明确选择，不默认执行
+Scripts/test-scroll-visibility-plan.sh # 小步预测及双元素位移核验，纯几何无GUI
+Scripts/test-scroll-target-guard.sh # 原目标身份、四阶段捕获/滚动交易与取消，无GUI
 Scripts/build.sh                # arm64 原生程序，本地签名
 Scripts/package.sh              # 先提交经审核源码，再归档 HEAD
 Scripts/install.sh              # 完整备份+恢复演练，安全替换，不启动程序

@@ -223,24 +223,57 @@ final class LiveScrollTargetProbe: ScrollTargetProbing {
 
 @MainActor
 enum ScrollAccessibilityAction {
-    /// One page action advertised by the original ROI's scroll area.
-    /// The source app defines the page size; no pixel distance or overlap is promised.
-    static func pageDown(target: ScrollTargetIdentity, anchor: CGPoint,
-                         windowIdentity: ScrollFocusIdentity, revalidate: () throws -> Void) throws {
-        let deadline = ProcessInfo.processInfo.systemUptime + 2
+    /// Session-local ordering hints only. Every hinted reference is checked again before use.
+    final class Cursor {
+        fileprivate var area: AXUIElement?
+        fileprivate var areaFrame: CGRect?
+        fileprivate var hints: [SiblingHint] = []
+    }
+    fileprivate struct SiblingHint {
+        let parent: AXUIElement
+        let child: AXUIElement
+        let index: Int
+    }
+    /// One advertised public action. There is no retry or second input strategy.
+    static func scrollDown(target: ScrollTargetIdentity, anchor: CGPoint, requestedPoints: CGFloat,
+                           windowIdentity: ScrollFocusIdentity, cursor: Cursor, revalidate: () throws -> Void) async throws {
+        guard #available(macOS 26.0, *) else {
+            throw CaptureFailure.unsupported("此系统版本不支持可核验的滚入视口动作，请手动滚动后捕获下一帧。")
+        }
+        try await scrollToVisible(target: target, anchor: anchor, requestedPoints: requestedPoints,
+                                  windowIdentity: windowIdentity, cursor: cursor, revalidate: revalidate)
+    }
+
+    @available(macOS 26.0, *)
+    private static func scrollToVisible(target: ScrollTargetIdentity, anchor: CGPoint, requestedPoints: CGFloat,
+                                        windowIdentity: ScrollFocusIdentity, cursor: Cursor, revalidate: () throws -> Void) async throws {
+        let transactionDeadline = ProcessInfo.processInfo.systemUptime + 5
+        var phaseDeadline = ProcessInfo.processInfo.systemUptime + 2
         let app = AXUIElementCreateApplication(target.processID)
-        let action = "AXScrollDownByPage" as CFString
-        let unavailable = CaptureFailure.unsupported("此滚动区域没有可核验的向下翻页动作，请手动滚动后捕获下一帧。")
+        let action = NSAccessibility.Action.scrollToVisibleAction.rawValue as CFString
+        let unavailable = CaptureFailure.unsupported("无法核验原滚动区域内的小步滚入目标，未发送动作；请手动滚动后捕获下一帧。")
+        guard let roi = target.scrollRegion, roi.contains(anchor) else { throw unavailable }
+
         func prepare(_ element: AXUIElement) throws {
-            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            try Task.checkCancellation()
+            let remaining = min(phaseDeadline, transactionDeadline) - ProcessInfo.processInfo.systemUptime
             var pid: pid_t = 0
             guard remaining > 0, AXUIElementSetMessagingTimeout(element, Float(min(0.2, remaining))) == .success,
                   AXUIElementGetPid(element, &pid) == .success, pid == target.processID else { throw unavailable }
         }
-        func value(_ element: AXUIElement, _ name: CFString) throws -> CFTypeRef {
+        func optionalValue(_ element: AXUIElement, _ name: CFString) throws -> CFTypeRef? {
             try prepare(element)
             var raw: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(element, name, &raw) == .success, let raw else { throw unavailable }
+            let result = AXUIElementCopyAttributeValue(element, name, &raw)
+            try Task.checkCancellation()
+            switch result {
+            case .success: return raw
+            case .attributeUnsupported, .noValue, .notImplemented: return nil
+            default: throw unavailable
+            }
+        }
+        func value(_ element: AXUIElement, _ name: CFString) throws -> CFTypeRef {
+            guard let raw = try optionalValue(element, name) else { throw unavailable }
             return raw
         }
         func elementValue(_ element: AXUIElement, _ name: CFString) throws -> AXUIElement {
@@ -250,61 +283,227 @@ enum ScrollAccessibilityAction {
         }
         func sameWindow(_ element: AXUIElement) throws {
             let window = try elementValue(element, kAXWindowAttribute as CFString)
-            let topLevel = try elementValue(element, kAXTopLevelUIElementAttribute as CFString)
-            try prepare(window); try prepare(topLevel)
+            let top = try elementValue(element, kAXTopLevelUIElementAttribute as CFString)
+            try prepare(window); try prepare(top)
             guard ScrollFocusIdentity(element: window) == windowIdentity,
-                  ScrollFocusIdentity(element: topLevel) == windowIdentity else { throw unavailable }
+                  ScrollFocusIdentity(element: top) == windowIdentity else { throw unavailable }
         }
-        func frame(_ element: AXUIElement) throws -> CGRect {
-            let rawPosition = try value(element, kAXPositionAttribute as CFString)
-            let rawSize = try value(element, kAXSizeAttribute as CFString)
-            guard CFGetTypeID(rawPosition) == AXValueGetTypeID(), CFGetTypeID(rawSize) == AXValueGetTypeID() else { throw unavailable }
-            let position = rawPosition as! AXValue, dimensions = rawSize as! AXValue
-            var point = CGPoint.zero, size = CGSize.zero
-            guard AXValueGetType(position) == .cgPoint, AXValueGetType(dimensions) == .cgSize,
-                  AXValueGetValue(position, .cgPoint, &point), AXValueGetValue(dimensions, .cgSize, &size) else { throw unavailable }
-            let rect = CGRect(origin: point, size: size)
-            guard CaptureWindowEligibility.validFrame(rect) else { throw unavailable }
-            return rect
+        func role(_ element: AXUIElement) throws -> String {
+            guard let result = try value(element, kAXRoleAttribute as CFString) as? String else { throw unavailable }
+            return result
         }
-        func resolve() throws -> (area: AXUIElement, frame: CGRect) {
+        func frame(_ element: AXUIElement) throws -> CGRect? {
+            guard let rawPosition = try optionalValue(element, kAXPositionAttribute as CFString),
+                  let rawSize = try optionalValue(element, kAXSizeAttribute as CFString),
+                  CFGetTypeID(rawPosition) == AXValueGetTypeID(), CFGetTypeID(rawSize) == AXValueGetTypeID() else { return nil }
+            let position = rawPosition as! AXValue, size = rawSize as! AXValue
+            var point = CGPoint.zero, dimensions = CGSize.zero
+            guard AXValueGetType(position) == .cgPoint, AXValueGetType(size) == .cgSize,
+                  AXValueGetValue(position, .cgPoint, &point), AXValueGetValue(size, .cgSize, &dimensions) else { return nil }
+            let result = CGRect(origin: point, size: dimensions)
+            return CaptureWindowEligibility.validFrame(result) ? result : nil
+        }
+        // A remote provider may expose a large document. Read bounded reference slices only,
+        // never AXContents or document text. The anchor and last verified target locate siblings.
+        typealias ParentPair = (child: AXUIElement, parent: AXUIElement)
+        var anchorParents: [ParentPair] = []
+        var discoveredEdges: [SiblingHint] = []
+        var indexReferenceBudget = 512
+        func childCount(_ element: AXUIElement, _ attribute: CFString) throws -> Int {
+            try prepare(element)
+            var count: CFIndex = 0
+            let result = AXUIElementGetAttributeValueCount(element, attribute, &count)
+            if [.attributeUnsupported, .noValue, .notImplemented].contains(result) { return 0 }
+            guard result == .success, count >= 0 else { throw unavailable }
+            return count
+        }
+        func slice(_ element: AXUIElement, _ attribute: CFString, start: Int, maximum: Int) throws -> [AXUIElement] {
+            let count = try childCount(element, attribute)
+            guard start >= 0, start < count else { return [] }
+            var raw: CFArray?
+            try prepare(element)
+            guard AXUIElementCopyAttributeValues(element, attribute, start, min(maximum, count - start), &raw) == .success,
+                  let items = raw as? [AXUIElement], items.count <= maximum else { throw unavailable }
+            return items
+        }
+        func locate(_ child: AXUIElement, in parent: AXUIElement) throws -> Int? {
+            // AXIndex is merely a hint: verify its reference against this exact parent's children.
+            if let number = try optionalValue(child, kAXIndexAttribute as CFString) as? NSNumber {
+                let index = number.intValue
+                if index >= 0, number.doubleValue == Double(index),
+                   let atIndex = try slice(parent, kAXChildrenAttribute as CFString, start: index, maximum: 1).first,
+                   CFEqual(atIndex, child) { return index }
+            }
+            var offset = 0
+            let count = try childCount(parent, kAXChildrenAttribute as CFString)
+            while offset < count, indexReferenceBudget > 0 {
+                let amount = min(32, count - offset, indexReferenceBudget)
+                let items = try slice(parent, kAXChildrenAttribute as CFString, start: offset, maximum: amount)
+                indexReferenceBudget -= amount
+                if let index = items.firstIndex(where: { CFEqual($0, child) }) { return offset + index }
+                guard !items.isEmpty else { return nil }
+                offset += items.count
+            }
+            return nil
+        }
+        func limitedChildren(_ element: AXUIElement) throws -> [AXUIElement] {
+            let visible = try slice(element, kAXVisibleChildrenAttribute as CFString, start: 0, maximum: 8)
+            var start = 0
+            // A fresh anchor wins after a legitimate manual scroll; an old valid index is
+            // only an ordering hint and must not strand the search near an earlier viewport.
+            if let pair = anchorParents.first(where: { CFEqual($0.parent, element) }),
+               let index = try locate(pair.child, in: element) {
+                start = max(0, index - 2)
+            } else if let hint = cursor.hints.first(where: { CFEqual($0.parent, element) }) {
+                if let atIndex = try slice(element, kAXChildrenAttribute as CFString, start: hint.index, maximum: 1).first,
+                   CFEqual(atIndex, hint.child) {
+                    start = max(0, hint.index - 2)
+                } else if let freshIndex = try locate(hint.child, in: element) {
+                    start = max(0, freshIndex - 2)
+                }
+            }
+            let direct = try slice(element, kAXChildrenAttribute as CFString, start: start, maximum: 8)
+            for (offset, child) in direct.enumerated() {
+                discoveredEdges.append(SiblingHint(parent: element, child: child, index: start + offset))
+            }
+            var result = visible
+            for item in direct where !result.contains(where: { CFEqual($0, item) }) { result.append(item) }
+            return result
+        }
+        func advertisesAction(_ element: AXUIElement) throws -> Bool {
+            try prepare(element)
+            var raw: CFArray?
+            let result = AXUIElementCopyActionNames(element, &raw)
+            if [.attributeUnsupported, .noValue, .notImplemented].contains(result) { return false }
+            guard result == .success, let names = raw as? [String] else { throw unavailable }
+            return names.contains(action as String)
+        }
+        typealias Node = (element: AXUIElement, frame: CGRect, role: String)
+        func resolveArea() throws -> (area: AXUIElement, frame: CGRect, ancestors: [Node], parents: [ParentPair]) {
             try prepare(app)
             var hit: AXUIElement?
             guard AXUIElementCopyElementAtPosition(app, Float(anchor.x), Float(anchor.y), &hit) == .success,
                   var current = hit else { throw unavailable }
+            var ancestors: [Node] = []
+            var parents: [ParentPair] = []
             for _ in 0..<24 {
-                try prepare(current)
-                let role = try value(current, kAXRoleAttribute as CFString) as? String
-                if role == kAXWindowRole as String { throw unavailable }
+                let currentRole = try role(current)
+                if currentRole == kAXWindowRole as String { throw unavailable }
                 try sameWindow(current)
-                if role == kAXScrollAreaRole as String {
-                    guard let roi = target.scrollRegion else { throw unavailable }
-                    let areaFrame = try frame(current)
-                    // Do not select a larger outer area when the nearest one does not contain the ROI.
-                    guard areaFrame.contains(roi) else { throw unavailable }
-                    var actions: CFArray?
-                    try prepare(current)
-                    guard AXUIElementCopyActionNames(current, &actions) == .success,
-                          let names = actions as? [String], names.contains(action as String) else { throw unavailable }
-                    return (current, areaFrame)
+                if currentRole == kAXScrollAreaRole as String {
+                    guard let bounds = try frame(current), bounds.contains(roi) else { throw unavailable }
+                    return (current, bounds, ancestors, parents)
                 }
+                if let bounds = try frame(current) { ancestors.append((current, bounds, currentRole)) }
+                let parent = try elementValue(current, kAXParentAttribute as CFString)
+                parents.append((current, parent))
+                current = parent
+            }
+            throw unavailable
+        }
+        func requireOriginalArea(_ element: AXUIElement, _ area: AXUIElement) throws {
+            var current = element
+            for _ in 0..<24 {
+                let currentRole = try role(current)
+                try sameWindow(current)
+                if currentRole == kAXScrollAreaRole as String {
+                    guard CFEqual(current, area) else { throw unavailable }
+                    return
+                }
+                if currentRole == kAXWindowRole as String { throw unavailable }
                 current = try elementValue(current, kAXParentAttribute as CFString)
             }
             throw unavailable
         }
-        let original = try resolve()
-        let latest = try resolve()
-        guard CFEqual(original.area, latest.area), original.frame == latest.frame else { throw unavailable }
-        try prepare(latest.area)
-        // Make the unchanged production focus/CG geometry guard the final major read before input.
+
+        let original = try resolveArea()
+        if let boundArea = cursor.area {
+            guard CFEqual(boundArea, original.area), cursor.areaFrame == original.frame else { throw unavailable }
+        } else {
+            cursor.area = original.area; cursor.areaFrame = original.frame
+        }
+        anchorParents = original.parents
+        var nodes = original.ancestors
+        var seen: [AXUIElement] = []
+        var queue = try limitedChildren(original.area).map { (element: $0, depth: 1) }
+        var visited = 0
+        let descendantBudget = max(0, 48 - original.ancestors.count)
+        while !queue.isEmpty, visited < descendantBudget {
+            let item = queue.removeFirst()
+            if seen.contains(where: { CFEqual($0, item.element) }) { continue }
+            seen.append(item.element); visited += 1
+            let itemRole = try role(item.element)
+            // A nested scroll area is a separate input target, even within the same window.
+            if itemRole == kAXScrollAreaRole as String || itemRole == kAXWindowRole as String { continue }
+            try sameWindow(item.element)
+            if !nodes.contains(where: { CFEqual($0.element, item.element) }), let bounds = try frame(item.element) {
+                nodes.append((item.element, bounds, itemRole))
+            }
+            if item.depth < 3 {
+                let descendants = try limitedChildren(item.element)
+                let room = max(0, 64 - queue.count)
+                queue.append(contentsOf: descendants.prefix(room).map { (element: $0, depth: item.depth + 1) })
+            }
+        }
+        let content = nodes.filter { node in
+            node.role != kAXScrollBarRole as String && node.role != kAXValueIndicatorRole as String
+                && node.frame.minX <= anchor.x && node.frame.maxX >= anchor.x
+        }
+        // Prefer a small visible content element over a stationary clipping container.
+        let markers = content.filter { $0.frame.intersects(roi) && $0.frame != original.frame }
+            .sorted { $0.frame.height < $1.frame.height }
+        guard let marker = markers.first else { throw unavailable }
+        var choices: [(node: Node, plan: ScrollVisibilityPlan)] = []
+        for node in content where !CFEqual(node.element, marker.element) {
+            guard let plan = try? ScrollVisibilityPlan.makePlan(viewport: original.frame, roi: roi,
+                                                               marker: marker.frame, target: node.frame,
+                                                               requestedPoints: requestedPoints) else { continue }
+            if try advertisesAction(node.element) { choices.append((node, plan)) }
+        }
+        guard let choice = choices.min(by: { $0.plan.expectedMinimumScroll < $1.plan.expectedMinimumScroll }) else { throw unavailable }
+
+        let latest = try resolveArea()
+        guard CFEqual(original.area, latest.area), original.frame == latest.frame,
+              try frame(marker.element) == marker.frame, try frame(choice.node.element) == choice.node.frame else { throw unavailable }
+        try requireOriginalArea(marker.element, original.area)
+        try requireOriginalArea(choice.node.element, original.area)
+        guard try advertisesAction(choice.node.element) else { throw unavailable }
+        try prepare(choice.node.element)
+        // The original production target/CG/focused-window guard is the last major read before input.
         try revalidate()
         try Task.checkCancellation()
-        guard ProcessInfo.processInfo.systemUptime < deadline,
+        guard ProcessInfo.processInfo.systemUptime < min(phaseDeadline, transactionDeadline),
               NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processID else { throw unavailable }
-        let result = AXUIElementPerformAction(latest.area, action)
+        let result = AXUIElementPerformAction(choice.node.element, action)
         guard result == .success else {
-            // A timeout can mean the action already ran. Never retry or fall back to a global event.
-            throw CaptureFailure.unsupported("滚动动作结果未确认（AX \(result.rawValue)），未自动重试；请核对原窗口后手动滚动。")
+            throw CaptureFailure.unsupported("滚入视口动作结果未确认（AX \(result.rawValue)），未重复发送；请检查原窗口后手动滚动。")
+        }
+        try await Task.sleep(nanoseconds: 450_000_000)
+        try Task.checkCancellation()
+        phaseDeadline = min(transactionDeadline, ProcessInfo.processInfo.systemUptime + 2)
+        do {
+            let after = try resolveArea()
+            guard CFEqual(original.area, after.area), original.frame == after.frame else { throw unavailable }
+            try requireOriginalArea(marker.element, original.area)
+            try requireOriginalArea(choice.node.element, original.area)
+            guard let markerAfter = try frame(marker.element), let targetAfter = try frame(choice.node.element) else { throw unavailable }
+            _ = try choice.plan.verify(viewportAfter: after.frame, roiAfter: target.scrollRegion,
+                                       markerAfter: markerAfter, targetAfter: targetAfter)
+            try prepare(marker.element); try prepare(choice.node.element)
+            guard ProcessInfo.processInfo.systemUptime < min(phaseDeadline, transactionDeadline),
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processID else { throw unavailable }
+            var hints: [SiblingHint] = []
+            var current = choice.node.element
+            for _ in 0..<3 {
+                guard !CFEqual(current, original.area),
+                      let edge = discoveredEdges.last(where: { CFEqual($0.child, current) }) else { break }
+                hints.append(edge); current = edge.parent
+            }
+            cursor.hints = hints
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw CaptureFailure.unsupported("滚动后的实际位移或窗口几何未通过核验，未追加截图；请核对原窗口后手动捕获。")
         }
     }
 }

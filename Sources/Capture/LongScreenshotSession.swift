@@ -85,6 +85,7 @@ final class LongScreenshotSession {
     private var pendingImage: CGImage?
     private var targetProbe: ScrollTargetProbing?
     private let targetGuard: ScrollTargetGuard?
+    private let accessibilityScrollCursor = ScrollAccessibilityAction.Cursor()
     private(set) var lastTargetDiagnostic: ScrollTargetDiagnostic?
     var pendingFrameHeight: Int? { pendingImage?.height }
 
@@ -166,10 +167,9 @@ final class LongScreenshotSession {
         guard AXIsProcessTrusted() else { throw CaptureFailure.unsupported("辅助功能权限未授权，仍可使用手动滚动逐帧拼接。") }
         return try await scrollAndCapture(downwardPoints: downwardPoints, performScroll: { anchor in
             guard let windowIdentity = self.targetGuard?.boundAccessibilityIdentity else { throw CaptureFailure.sourceMissing }
-            try ScrollAccessibilityAction.pageDown(target: target, anchor: anchor, windowIdentity: windowIdentity) {
+            try await ScrollAccessibilityAction.scrollDown(target: target, anchor: anchor, requestedPoints: CGFloat(downwardPoints), windowIdentity: windowIdentity, cursor: self.accessibilityScrollCursor) {
                 _ = try self.validateCurrentTarget(stage: .preScroll)
             }
-            try await Task.sleep(nanoseconds: 450_000_000)
         }, capturing: { try await service.capture(source, options: options).image })
     }
 
