@@ -67,6 +67,7 @@ enum ScrollSeamPreviewRenderer {
 private struct ScrollFrameSegment {
     let image: CGImage
     let overlap: Int
+    let backingBytes: Int
 }
 
 /// In-memory bounded scroll stitching. Exceeding the budget stops before allocation; this implementation
@@ -83,6 +84,7 @@ final class LongScreenshotSession {
     private(set) var estimatedPeakMemoryBytes = 0
     private var segments: [ScrollFrameSegment] = []
     private var pendingImage: CGImage?
+    private var pendingBackingBytes = 0
     private var targetProbe: ScrollTargetProbing?
     private let targetGuard: ScrollTargetGuard?
     private let accessibilityScrollCursor = ScrollAccessibilityAction.Cursor()
@@ -106,6 +108,7 @@ final class LongScreenshotSession {
     func addFrame(_ frame: CGImage) throws -> ScrollSeamEstimate? {
         guard state != .cancelled, state != .completed else { throw CaptureFailure.cancelled }
         guard pendingSeam == nil else { throw CaptureFailure.unsupported("请先预览并确认或拒绝上一条接缝。") }
+        let backingBytes = try LongCaptureWindowCrop.imageBytes(frame)
         let image = try normalized(frame)
         guard segments.count < budget.maximumFrames else { throw CaptureFailure.budgetExceeded }
         if let previous = segments.last?.image {
@@ -116,14 +119,14 @@ final class LongScreenshotSession {
             state = .capturing
             let estimate = try ScrollOverlapMatcher.estimate(previous: previous, current: image)
             if estimate.duplicate { state = .paused("画面没有移动，可能已到边界；当前帧未重复追加。"); return estimate }
-            try checkBudget(adding: image, overlap: estimate.overlapPixels)
+            try checkBudget(adding: image, overlap: estimate.overlapPixels, backingBytes: backingBytes)
             if estimate.confidence < 0.88 || !estimate.warnings.isEmpty {
-                pendingImage = image; pendingSeam = estimate; state = .awaitingSeam
-            } else { append(image, estimate: estimate) }
+                pendingImage = image; pendingBackingBytes = backingBytes; pendingSeam = estimate; state = .awaitingSeam
+            } else { append(image, estimate: estimate, backingBytes: backingBytes) }
             return estimate
         }
-        try checkBudget(adding: image, overlap: 0)
-        segments.append(ScrollFrameSegment(image: image, overlap: 0)); capturedFrameCount = 1
+        try checkBudget(adding: image, overlap: 0, backingBytes: backingBytes)
+        segments.append(ScrollFrameSegment(image: image, overlap: 0, backingBytes: backingBytes)); capturedFrameCount = 1
         outputHeight = image.height; state = .capturing; return nil
     }
 
@@ -132,19 +135,46 @@ final class LongScreenshotSession {
         guard let image = pendingImage, let estimate = pendingSeam else { return }
         let overlap = overlapPixels ?? estimate.overlapPixels
         guard overlap >= 0, overlap < image.height else { throw CaptureFailure.invalidRegion }
-        try checkBudget(adding: image, overlap: overlap)
+        let backingBytes = pendingBackingBytes
+        try checkBudget(adding: image, overlap: overlap, backingBytes: backingBytes)
         let accepted = ScrollSeamEstimate(overlapPixels: overlap, confidence: estimate.confidence, meanAbsoluteError: estimate.meanAbsoluteError, duplicate: false, warnings: estimate.warnings + ["用户已预览并确认接缝"], previousPreview: estimate.previousPreview, currentPreview: estimate.currentPreview)
-        pendingImage = nil; pendingSeam = nil; append(image, estimate: accepted)
+        pendingImage = nil; pendingBackingBytes = 0; pendingSeam = nil; append(image, estimate: accepted, backingBytes: backingBytes)
     }
 
-    func rejectPending() { pendingImage = nil; pendingSeam = nil; state = .paused("已拒绝接缝，可手动调整目标滚动位置后重试。") }
+    func rejectPending() { pendingImage = nil; pendingBackingBytes = 0; pendingSeam = nil; state = .paused("已拒绝接缝，可手动调整目标滚动位置后重试。") }
     func pause(_ reason: String = "用户暂停") { if state != .cancelled && state != .completed { state = .paused(reason) } }
-    func cancel() { state = .cancelled; pendingImage = nil; pendingSeam = nil; segments.removeAll(); seams.removeAll(); outputHeight = 0; capturedFrameCount = 0 }
+    func cancel() { state = .cancelled; pendingImage = nil; pendingBackingBytes = 0; pendingSeam = nil; segments.removeAll(); seams.removeAll(); outputHeight = 0; capturedFrameCount = 0 }
 
     /// Real capture verifies the foreground PID and selected window before and after every frame.
     @discardableResult
     func captureNext(using service: CaptureService, source: CaptureSource, options: CaptureOptions = .init()) async throws -> ScrollSeamEstimate? {
-        try await captureNext(capturing: { try await service.capture(source, options: options).image })
+        try await captureNext(capturing: { try await self.captureBoundWindowRegion(using: service, source: source, options: options) })
+    }
+
+    private func captureBoundWindowRegion(using service: CaptureService, source: CaptureSource,
+                                          options: CaptureOptions) async throws -> CGImage {
+        guard #available(macOS 14.2, *) else {
+            throw CaptureFailure.unsupported("窗口内长截图需要 macOS 14.2 或更新版本。")
+        }
+        guard let target, let windowFrame = target.frame, let region = target.scrollRegion,
+              case .window(let windowID) = source, windowID == target.windowID else { throw CaptureFailure.invalidRegion }
+        guard pendingImage == nil, pendingSeam == nil else {
+            throw CaptureFailure.unsupported("请先预览并确认或拒绝上一条接缝。")
+        }
+        let retained = segments.map(\.backingBytes)
+        let maximumBytes = min(options.maximumMemoryBytes, budget.maximumMemoryBytes)
+        let available = try LongCaptureWindowCrop.remainingBytes(maximum: maximumBytes, retained: retained)
+        var windowOptions = options
+        windowOptions.includesShadow = false
+        windowOptions.includesChildWindows = false
+        windowOptions.maximumMemoryBytes = available
+        windowOptions.maximumPixels = min(options.maximumPixels, budget.maximumPixels)
+        let frame = try await service.capture(.window(windowID), options: windowOptions)
+        let crop = try LongCaptureWindowCrop.copy(frame.image, windowFrame: windowFrame,
+            capturedBounds: frame.logicalBounds, desktopRegion: region, scale: frame.scale,
+            maximumPixels: windowOptions.maximumPixels, maximumBytes: available)
+        estimatedPeakMemoryBytes = max(estimatedPeakMemoryBytes, maximumBytes - available + crop.workingBytes)
+        return crop.image
     }
 
     /// The same production transaction accepts an in-memory producer in isolated CLI tests.
@@ -171,7 +201,7 @@ final class LongScreenshotSession {
             try await ScrollAccessibilityAction.scrollDown(target: target, anchor: anchor, requestedPoints: CGFloat(downwardPoints), windowIdentity: windowIdentity, cursor: self.accessibilityScrollCursor, waitingForPointer: waitingForPointer) {
                 _ = try self.validateCurrentTarget(stage: .preScroll)
             }
-        }, capturing: { try await service.capture(source, options: options).image })
+        }, capturing: { try await self.captureBoundWindowRegion(using: service, source: source, options: options) })
     }
 
     /// Injects only the producer and explicit one-shot action, keeping all production guard stages.
@@ -245,19 +275,24 @@ final class LongScreenshotSession {
         return crop
     }
 
-    private func checkBudget(adding image: CGImage, overlap: Int) throws {
+    private func checkBudget(adding image: CGImage, overlap: Int, backingBytes: Int) throws {
         let proposedHeight = outputHeight + image.height - overlap
         guard proposedHeight <= budget.maximumHeight else { throw CaptureFailure.budgetExceeded }
         try CaptureGeometry.validateBudget(width: image.width, height: proposedHeight, maximumPixels: budget.maximumPixels, maximumBytes: budget.maximumMemoryBytes)
-        // Retained frames + full output + two working normalized bitmaps + pending seam previews.
-        let retained = segments.reduce(0) { $0 + $1.image.bytesPerRow * $1.image.height }
-        let peak = retained + image.bytesPerRow * image.height * 3 + image.width * proposedHeight * 4
-        guard peak <= budget.maximumMemoryBytes else { throw CaptureFailure.budgetExceeded }
+        // Normalizing fixed edges may retain the complete ROI parent. Charge its actual backing,
+        // as well as the existing conservative working copies and full stitched output.
+        let available = try LongCaptureWindowCrop.remainingBytes(maximum: budget.maximumMemoryBytes,
+                                                                 retained: segments.map(\.backingBytes))
+        let outputBytes = image.width * proposedHeight * 4
+        let workingBytes = max(backingBytes, try LongCaptureWindowCrop.imageBytes(image))
+        guard outputBytes <= available, workingBytes > 0,
+              workingBytes <= (available - outputBytes) / 3 else { throw CaptureFailure.budgetExceeded }
+        let peak = budget.maximumMemoryBytes - available + workingBytes * 3 + outputBytes
         estimatedPeakMemoryBytes = max(estimatedPeakMemoryBytes, peak)
     }
 
-    private func append(_ image: CGImage, estimate: ScrollSeamEstimate) {
-        segments.append(ScrollFrameSegment(image: image, overlap: estimate.overlapPixels)); seams.append(estimate)
+    private func append(_ image: CGImage, estimate: ScrollSeamEstimate, backingBytes: Int) {
+        segments.append(ScrollFrameSegment(image: image, overlap: estimate.overlapPixels, backingBytes: backingBytes)); seams.append(estimate)
         capturedFrameCount += 1; outputHeight += image.height - estimate.overlapPixels; state = .capturing
     }
 }

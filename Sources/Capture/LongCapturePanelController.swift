@@ -46,9 +46,9 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
             settle: { try await Task.sleep(nanoseconds: 350_000_000) })
         try operation.checkActive()
         guard self.operation === operation else { throw CancellationError() }
-        let window = prepared.window, display = prepared.display, region = prepared.region
+        let window = prepared.window, region = prepared.region
         self.service = service; self.options = options; self.completion = onComplete
-        self.source = .region(displayID: display.id, rectInDisplayPoints: region.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY))
+        self.source = .window(window.id)
         self.session = LongScreenshotSession(target: ScrollTargetIdentity(processID: window.processID, windowID: window.id, frame: window.frame, scrollRegion: region))
         buildPanel(targetName: window.applicationName)
         captureNext(scroll: false)

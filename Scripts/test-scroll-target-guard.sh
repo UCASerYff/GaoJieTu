@@ -10,7 +10,7 @@ SCROLL_GUARD_LOG="$PWD/TestResults/scroll-target-guard-tests.txt"
 date -u '+Scroll target guard targeted CLI started: %Y-%m-%dT%H:%M:%SZ' | tee "$SCROLL_GUARD_LOG"
 xcrun swiftc -Xfrontend -disable-sandbox -D SCROLL_TARGET_GUARD_TESTS -swift-version 5 \
   -target arm64-apple-macos14.0 -module-cache-path "$SCROLL_GUARD_STAGE/ModuleCache" \
-  Sources/Capture/CaptureService.swift Sources/Capture/ScrollTargetGuard.swift Sources/Capture/ScrollVisibilityPlan.swift Sources/Capture/ScrollInputPolicy.swift Sources/Capture/ScrollPixelEventBundle.swift Sources/Capture/LongScreenshotSession.swift \
+  Sources/Capture/CaptureService.swift Sources/Capture/LongCaptureWindowCrop.swift Sources/Capture/ScrollTargetGuard.swift Sources/Capture/ScrollVisibilityPlan.swift Sources/Capture/ScrollInputPolicy.swift Sources/Capture/ScrollPixelEventBundle.swift Sources/Capture/LongScreenshotSession.swift \
   Tests/ScrollTargetGuardTests.swift -o "$SCROLL_GUARD_STAGE/ScrollTargetGuardTests" 2>&1 | tee -a "$SCROLL_GUARD_LOG"
 "$SCROLL_GUARD_STAGE/ScrollTargetGuardTests" 2>&1 | tee -a "$SCROLL_GUARD_LOG"
 printf 'Output: %s\n' "$SCROLL_GUARD_LOG"
