@@ -239,6 +239,8 @@ enum ScrollAccessibilityAction {
         var lastAXResult: Int32 = AXError.success.rawValue
         var visited = 0, skipped = 0, content = 0, choices = 0
         var actionAttempted = false, actionSucceeded = false
+        var geometryChoices = 0, actionArraysParsed = 0, inputStrategy = 0
+        var pixelPosted = false
 
         mutating func observed(_ result: AXError, _ operation: Operation, _ name: CFString? = nil) -> AXError {
             self.operation = operation
@@ -253,7 +255,7 @@ enum ScrollAccessibilityAction {
 
         func recordFailure() {
             #if !SCROLL_TARGET_GUARD_TESTS
-            Logger(subsystem: "com.gaoseries.GaoJieTu", category: "LongCaptureScroll").error("stage=\(stage.rawValue, privacy: .public) operation=\(operation.rawValue, privacy: .public) attribute=\(attribute, privacy: .public) lastAXResult=\(lastAXResult, privacy: .public) visited=\(visited, privacy: .public) skipped=\(skipped, privacy: .public) content=\(content, privacy: .public) choices=\(choices, privacy: .public) actionAttempted=\(actionAttempted, privacy: .public) actionSucceeded=\(actionSucceeded, privacy: .public)")
+            Logger(subsystem: "com.gaoseries.GaoJieTu", category: "LongCaptureScroll").error("stage=\(stage.rawValue, privacy: .public) operation=\(operation.rawValue, privacy: .public) attribute=\(attribute, privacy: .public) lastAXResult=\(lastAXResult, privacy: .public) visited=\(visited, privacy: .public) skipped=\(skipped, privacy: .public) content=\(content, privacy: .public) choices=\(choices, privacy: .public) actionAttempted=\(actionAttempted, privacy: .public) actionSucceeded=\(actionSucceeded, privacy: .public) geometryChoices=\(geometryChoices, privacy: .public) actionArraysParsed=\(actionArraysParsed, privacy: .public) inputStrategy=\(inputStrategy, privacy: .public) pixelPosted=\(pixelPosted, privacy: .public)")
             #endif
         }
     }
@@ -269,7 +271,7 @@ enum ScrollAccessibilityAction {
         let child: AXUIElement
         let index: Int
     }
-    /// One advertised public action. There is no retry or second input strategy.
+    /// Select one verified native action, or one PID-directed pixel event after proven native absence. Never retry.
     static func scrollDown(target: ScrollTargetIdentity, anchor: CGPoint, requestedPoints: CGFloat,
                            windowIdentity: ScrollFocusIdentity, cursor: Cursor, revalidate: () throws -> Void) async throws {
         guard #available(macOS 26.0, *) else {
@@ -284,6 +286,7 @@ enum ScrollAccessibilityAction {
                                         windowIdentity: ScrollFocusIdentity, cursor: Cursor, revalidate: () throws -> Void) async throws {
         var diagnostic = FailureDiagnostic()
         var completed = false
+        var inputAttempted = false
         defer { if !completed { diagnostic.recordFailure() } }
         let transactionDeadline = ProcessInfo.processInfo.systemUptime + 5
         var phaseDeadline = ProcessInfo.processInfo.systemUptime + 2
@@ -410,13 +413,15 @@ enum ScrollAccessibilityAction {
             for item in direct where !result.contains(where: { CFEqual($0, item) }) { result.append(item) }
             return result
         }
-        func advertisesAction(_ element: AXUIElement) throws -> Bool {
+        func actionCapability(_ element: AXUIElement) throws -> ScrollInputPolicy.Capability {
             try prepare(element)
             var raw: CFArray?
             let result = diagnostic.observed(AXUIElementCopyActionNames(element, &raw), .actionNames)
-            if [.attributeUnsupported, .noValue, .notImplemented].contains(result) { return false }
-            guard result == .success, let names = raw as? [String] else { throw unavailable }
-            return names.contains(action as String)
+            // Unknown action capability never authorizes CG; another verified native target may still win.
+            // prepare() identity/deadline failures continue to throw before this classification.
+            guard result == .success, let names = raw as? [String] else { return .unknown }
+            diagnostic.actionArraysParsed += 1
+            return names.contains(action as String) ? .advertised : .absent
         }
         typealias Node = (element: AXUIElement, frame: CGRect, role: String)
         func resolveArea() throws -> (area: AXUIElement, frame: CGRect, ancestors: [Node], parents: [ParentPair]) {
@@ -505,16 +510,23 @@ enum ScrollAccessibilityAction {
             .sorted { $0.frame.height < $1.frame.height }
         guard let marker = markers.first else { throw unavailable }
         diagnostic.stage = .choices
-        var choices: [(node: Node, plan: ScrollVisibilityPlan)] = []
+        var choices: [(node: Node, plan: ScrollVisibilityPlan, capability: ScrollInputPolicy.Capability)] = []
         for node in content where !CFEqual(node.element, marker.element) {
             guard let plan = try? ScrollVisibilityPlan.makePlan(viewport: original.frame, roi: roi,
                                                                marker: marker.frame, target: node.frame,
                                                                requestedPoints: requestedPoints) else { continue }
-            if try advertisesAction(node.element) {
-                choices.append((node, plan)); diagnostic.choices = choices.count
-            }
+            diagnostic.geometryChoices += 1
+            let capability = try actionCapability(node.element)
+            choices.append((node, plan, capability))
+            if capability == .advertised { diagnostic.choices += 1 }
         }
-        guard let choice = choices.min(by: { $0.plan.expectedMinimumScroll < $1.plan.expectedMinimumScroll }) else { throw unavailable }
+        let decision: ScrollInputPolicy.Decision
+        do {
+            decision = try ScrollInputPolicy.select(choices.map { .init(plan: $0.plan, capability: $0.capability) },
+                                                    requestedPoints: requestedPoints)
+        } catch { throw unavailable }
+        let choice = choices[decision.index]
+        diagnostic.inputStrategy = decision.strategy.rawValue
 
         diagnostic.stage = .beforeInput
         let latest = try resolveArea()
@@ -522,7 +534,21 @@ enum ScrollAccessibilityAction {
               try frame(marker.element) == marker.frame, try frame(choice.node.element) == choice.node.frame else { throw unavailable }
         try requireOriginalArea(marker.element, original.area)
         try requireOriginalArea(choice.node.element, original.area)
-        guard try advertisesAction(choice.node.element) else { throw unavailable }
+        let freshCapability = try actionCapability(choice.node.element)
+        // This preflight cannot request TCC. A missing existing grant stops before any event.
+        let postingAvailable = decision.strategy == .native || CGPreflightPostEventAccess()
+        do {
+            try ScrollInputPolicy.requireReady(decision, freshCapability: freshCapability,
+                                               inputAlreadyAttempted: inputAttempted, postingAvailable: postingAvailable)
+        } catch { throw unavailable }
+        let pixelEvent: CGEvent?
+        if decision.strategy == .pixel {
+            guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                                      wheel1: -decision.pixels, wheel2: 0, wheel3: 0) else { throw unavailable }
+            event.location = anchor
+            event.flags = []
+            pixelEvent = event
+        } else { pixelEvent = nil }
         try prepare(choice.node.element)
         // The original production target/CG/focused-window guard is the last major read before input.
         try revalidate()
@@ -530,12 +556,25 @@ enum ScrollAccessibilityAction {
         guard ProcessInfo.processInfo.systemUptime < min(phaseDeadline, transactionDeadline),
               NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processID else { throw unavailable }
         diagnostic.stage = .performAction
-        diagnostic.actionAttempted = true
-        let result = diagnostic.observed(AXUIElementPerformAction(choice.node.element, action), .performAction)
-        guard result == .success else {
-            throw CaptureFailure.unsupported("滚入视口动作结果未确认（AX \(result.rawValue)），未重复发送；请检查原窗口后手动滚动。")
+        do {
+            try ScrollInputPolicy.requireReady(decision, freshCapability: freshCapability,
+                                               inputAlreadyAttempted: inputAttempted, postingAvailable: postingAvailable)
+        } catch { throw unavailable }
+        inputAttempted = true
+        switch decision.strategy {
+        case .native:
+            diagnostic.actionAttempted = true
+            let result = diagnostic.observed(AXUIElementPerformAction(choice.node.element, action), .performAction)
+            guard result == .success else {
+                throw CaptureFailure.unsupported("滚入视口动作结果未确认（AX \(result.rawValue)），未重复发送；请检查原窗口后手动滚动。")
+            }
+            diagnostic.actionSucceeded = true
+        case .pixel:
+            guard let pixelEvent else { throw unavailable }
+            pixelEvent.postToPid(target.processID)
+            // A void post is only an attempt, never evidence of delivery or source movement.
+            diagnostic.pixelPosted = true
         }
-        diagnostic.actionSucceeded = true
         diagnostic.stage = .settling
         try await Task.sleep(nanoseconds: 450_000_000)
         try Task.checkCancellation()
