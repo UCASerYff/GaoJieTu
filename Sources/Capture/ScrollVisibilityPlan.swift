@@ -3,8 +3,9 @@ import CoreGraphics
 
 /// Geometry only. The live adapter must bind and recheck the identities of both AX elements.
 struct ScrollVisibilityPlan: Equatable {
-    enum Failure: Error, Equatable {
-        case invalidGeometry, invalidBudget, regionOutsideViewport
+    enum Failure: Int, Error, Equatable {
+        // Stable numeric failure codes for metadata-only diagnostics; zero means not reached.
+        case invalidGeometry = 1, invalidBudget, regionOutsideViewport
         case markerOutsideRegion, targetOutsideColumn, targetTooTall
         case targetAlreadyVisible, minimumScrollExceedsBudget
         case viewportChanged, regionChanged, elementGeometryChanged
