@@ -1,5 +1,5 @@
 #!/bin/bash
-# Construct two events and read their fields in memory only. No posts, pointer queries, UI or AX.
+# Construct one bounded wheel in memory only. No posts, pointer queries, UI or AX.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ $# -ne 0 ]]; then echo '本脚本不接受参数' >&2; exit 2; fi

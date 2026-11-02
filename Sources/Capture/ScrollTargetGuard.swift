@@ -228,7 +228,7 @@ enum ScrollAccessibilityAction {
         enum Stage: Int {
             case region = 1, originalArea, areaBinding, descendants, marker, choices
             case beforeInput, performAction, settling, afterInput
-            case priming, beforeWheel
+            case pointerWait, beforeWheel
         }
         enum Operation: Int {
             case none = 0, deadline, messagingTimeout, processID, attributeValue
@@ -237,7 +237,8 @@ enum ScrollAccessibilityAction {
         enum Substep: Int {
             case none = 0, resolveArea, areaIdentity, areaGeometry, markerParent, targetParent
             case markerFrame, targetFrame, capability, postingPreflight, sourceGuard, deadlineAndFocus
-            case primePost, primeWait, wheelPost, motionVerify, completion
+            case pointerWait, pointerHit, wheelPost, motionVerify, completion
+            case pointerPosition, mouseButtons
         }
         var stage = Stage.region
         var operation = Operation.none
@@ -247,7 +248,9 @@ enum ScrollAccessibilityAction {
         var visited = 0, skipped = 0, content = 0, choices = 0
         var actionAttempted = false, actionSucceeded = false
         var geometryChoices = 0, actionArraysParsed = 0, inputStrategy = 0
-        var primePosted = false, wheelPosted = false, logicalInputState = 0
+        var wheelPosted = false, logicalInputState = 0
+        var pointerInsideROI = -1, pointerWindowMatches = -1, pointerAreaMatches = -1
+        var pointerStayed = -1, pointerButtonsReleased = -1, pointerWaitMilliseconds = -1
         var areaIdentityMatches = -1, areaFrameMatches = -1
         var markerFrameParsed = -1, targetFrameParsed = -1
         var motionValuesAvailable = false, verifyAttempted = false, verifyPassed = false
@@ -273,7 +276,7 @@ enum ScrollAccessibilityAction {
 
         func recordFailure() {
             #if !SCROLL_TARGET_GUARD_TESTS
-            Logger(subsystem: "com.gaoseries.GaoJieTu", category: "LongCaptureScroll").error("stage=\(stage.rawValue, privacy: .public) operation=\(operation.rawValue, privacy: .public) attribute=\(attribute, privacy: .public) lastAXResult=\(lastAXResult, privacy: .public) visited=\(visited, privacy: .public) skipped=\(skipped, privacy: .public) content=\(content, privacy: .public) choices=\(choices, privacy: .public) actionAttempted=\(actionAttempted, privacy: .public) actionSucceeded=\(actionSucceeded, privacy: .public) geometryChoices=\(geometryChoices, privacy: .public) actionArraysParsed=\(actionArraysParsed, privacy: .public) inputStrategy=\(inputStrategy, privacy: .public) pixelPosted=\(wheelPosted, privacy: .public) primePosted=\(primePosted, privacy: .public) wheelPosted=\(wheelPosted, privacy: .public) postedEventCount=\((primePosted ? 1 : 0) + (wheelPosted ? 1 : 0), privacy: .public) logicalInputState=\(logicalInputState, privacy: .public) substep=\(substep.rawValue, privacy: .public) areaIdentityMatches=\(areaIdentityMatches, privacy: .public) areaFrameMatches=\(areaFrameMatches, privacy: .public) markerFrameParsed=\(markerFrameParsed, privacy: .public) targetFrameParsed=\(targetFrameParsed, privacy: .public) motionValuesAvailable=\(motionValuesAvailable, privacy: .public) markerDelta=\(markerDelta, privacy: .public) targetDelta=\(targetDelta, privacy: .public) verifyAttempted=\(verifyAttempted, privacy: .public) verifyPassed=\(verifyPassed, privacy: .public) verifyFailure=\(verifyFailure, privacy: .public)")
+            Logger(subsystem: "com.gaoseries.GaoJieTu", category: "LongCaptureScroll").error("stage=\(stage.rawValue, privacy: .public) operation=\(operation.rawValue, privacy: .public) attribute=\(attribute, privacy: .public) lastAXResult=\(lastAXResult, privacy: .public) visited=\(visited, privacy: .public) skipped=\(skipped, privacy: .public) content=\(content, privacy: .public) choices=\(choices, privacy: .public) actionAttempted=\(actionAttempted, privacy: .public) actionSucceeded=\(actionSucceeded, privacy: .public) geometryChoices=\(geometryChoices, privacy: .public) actionArraysParsed=\(actionArraysParsed, privacy: .public) inputStrategy=\(inputStrategy, privacy: .public) pixelPosted=\(wheelPosted, privacy: .public) wheelPosted=\(wheelPosted, privacy: .public) postedEventCount=\(wheelPosted ? 1 : 0, privacy: .public) logicalInputState=\(logicalInputState, privacy: .public) substep=\(substep.rawValue, privacy: .public) areaIdentityMatches=\(areaIdentityMatches, privacy: .public) areaFrameMatches=\(areaFrameMatches, privacy: .public) markerFrameParsed=\(markerFrameParsed, privacy: .public) targetFrameParsed=\(targetFrameParsed, privacy: .public) motionValuesAvailable=\(motionValuesAvailable, privacy: .public) markerDelta=\(markerDelta, privacy: .public) targetDelta=\(targetDelta, privacy: .public) verifyAttempted=\(verifyAttempted, privacy: .public) verifyPassed=\(verifyPassed, privacy: .public) verifyFailure=\(verifyFailure, privacy: .public) pointerInsideROI=\(pointerInsideROI, privacy: .public) pointerWindowMatches=\(pointerWindowMatches, privacy: .public) pointerAreaMatches=\(pointerAreaMatches, privacy: .public) pointerStayed=\(pointerStayed, privacy: .public) pointerButtonsReleased=\(pointerButtonsReleased, privacy: .public) pointerWaitMilliseconds=\(pointerWaitMilliseconds, privacy: .public)")
             #endif
         }
     }
@@ -289,19 +292,22 @@ enum ScrollAccessibilityAction {
         let child: AXUIElement
         let index: Int
     }
-    /// One native action, or one window-bound hover plus one PID-directed wheel. Never retry.
+    /// One native action, or one wheel at the real pointer after exact source hits. Never retry.
     static func scrollDown(target: ScrollTargetIdentity, anchor: CGPoint, requestedPoints: CGFloat,
-                           windowIdentity: ScrollFocusIdentity, cursor: Cursor, revalidate: () throws -> Void) async throws {
+                           windowIdentity: ScrollFocusIdentity, cursor: Cursor, waitingForPointer: () -> Void = {},
+                           revalidate: () throws -> Void) async throws {
         guard #available(macOS 26.0, *) else {
             throw CaptureFailure.unsupported("此系统版本不支持可核验的滚入视口动作，请手动滚动后捕获下一帧。")
         }
         try await scrollToVisible(target: target, anchor: anchor, requestedPoints: requestedPoints,
-                                  windowIdentity: windowIdentity, cursor: cursor, revalidate: revalidate)
+                                  windowIdentity: windowIdentity, cursor: cursor,
+                                  waitingForPointer: waitingForPointer, revalidate: revalidate)
     }
 
     @available(macOS 26.0, *)
     private static func scrollToVisible(target: ScrollTargetIdentity, anchor: CGPoint, requestedPoints: CGFloat,
-                                        windowIdentity: ScrollFocusIdentity, cursor: Cursor, revalidate: () throws -> Void) async throws {
+                                        windowIdentity: ScrollFocusIdentity, cursor: Cursor, waitingForPointer: () -> Void,
+                                        revalidate: () throws -> Void) async throws {
         var diagnostic = FailureDiagnostic()
         var completed = false
         var attempt = ScrollInputPolicy.Attempt()
@@ -448,10 +454,10 @@ enum ScrollAccessibilityAction {
             return names.contains(action as String) ? .advertised : .absent
         }
         typealias Node = (element: AXUIElement, frame: CGRect, role: String)
-        func resolveArea() throws -> (area: AXUIElement, frame: CGRect, ancestors: [Node], parents: [ParentPair]) {
+        func resolveArea(at point: CGPoint) throws -> (area: AXUIElement, frame: CGRect, ancestors: [Node], parents: [ParentPair]) {
             try prepare(app)
             var hit: AXUIElement?
-            guard diagnostic.observed(AXUIElementCopyElementAtPosition(app, Float(anchor.x), Float(anchor.y), &hit), .hitTest) == .success,
+            guard diagnostic.observed(AXUIElementCopyElementAtPosition(app, Float(point.x), Float(point.y), &hit), .hitTest) == .success,
                   var current = hit else { throw unavailable }
             var ancestors: [Node] = []
             var parents: [ParentPair] = []
@@ -486,7 +492,7 @@ enum ScrollAccessibilityAction {
         }
 
         diagnostic.stage = .originalArea
-        let original = try resolveArea()
+        let original = try resolveArea(at: anchor)
         diagnostic.stage = .areaBinding
         if let boundArea = cursor.area {
             guard CFEqual(boundArea, original.area), cursor.areaFrame == original.frame else { throw unavailable }
@@ -553,12 +559,13 @@ enum ScrollAccessibilityAction {
         diagnostic.inputStrategy = decision.strategy.rawValue
 
         // Reuse the original references and the bounded anchor hit-test. Never rescan or reselect candidates.
-        func checkedGeometry(requireUnmoved: Bool) throws -> (areaFrame: CGRect, marker: CGRect, target: CGRect) {
+        func checkedGeometry(requireUnmoved: Bool, hitPoint: CGPoint? = nil) throws -> (areaFrame: CGRect, marker: CGRect, target: CGRect) {
             diagnostic.beginGeometryCheck()
             diagnostic.substep = .resolveArea
-            let latest = try resolveArea()
+            let latest = try resolveArea(at: hitPoint ?? anchor)
             diagnostic.substep = .areaIdentity
             diagnostic.areaIdentityMatches = CFEqual(original.area, latest.area) ? 1 : 0
+            if hitPoint != nil { diagnostic.pointerAreaMatches = diagnostic.areaIdentityMatches }
             guard diagnostic.areaIdentityMatches == 1 else { throw unavailable }
             diagnostic.substep = .areaGeometry
             diagnostic.areaFrameMatches = original.frame == latest.frame ? 1 : 0
@@ -577,8 +584,8 @@ enum ScrollAccessibilityAction {
             guard let targetNow, !requireUnmoved || targetNow == choice.node.frame else { throw unavailable }
             return (latest.frame, markerNow, targetNow)
         }
-        func checkedInputReadiness() throws -> (capability: ScrollInputPolicy.Capability, postingAvailable: Bool) {
-            _ = try checkedGeometry(requireUnmoved: true)
+        func checkedInputReadiness(hitPoint: CGPoint? = nil) throws -> (capability: ScrollInputPolicy.Capability, postingAvailable: Bool) {
+            _ = try checkedGeometry(requireUnmoved: true, hitPoint: hitPoint)
             diagnostic.substep = .capability
             let capability = try actionCapability(choice.node.element)
             diagnostic.substep = .postingPreflight
@@ -599,6 +606,51 @@ enum ScrollAccessibilityAction {
             try revalidate()
             try checkDeadlineAndFocus()
         }
+        func readPointer() throws -> CGPoint {
+            diagnostic.substep = .pointerPosition
+            try Task.checkCancellation()
+            guard ProcessInfo.processInfo.systemUptime < min(phaseDeadline, transactionDeadline),
+                  let event = CGEvent(source: nil) else { throw unavailable }
+            let point = event.location
+            guard point.x.isFinite, point.y.isFinite else { throw unavailable }
+            return point
+        }
+        func pointerInRegion() async throws -> CGPoint {
+            diagnostic.stage = .pointerWait
+            diagnostic.substep = .pointerWait
+            let began = ProcessInfo.processInfo.systemUptime
+            let deadline = try ScrollInputPolicy.PointerWaitDeadline.fixedDeadline(
+                now: began, phaseDeadline: phaseDeadline, transactionDeadline: transactionDeadline)
+            var announced = false
+            while true {
+                try Task.checkCancellation()
+                do { try ScrollInputPolicy.PointerWaitDeadline.requireActive(now: ProcessInfo.processInfo.systemUptime, deadline: deadline) }
+                catch { throw CaptureFailure.unsupported("鼠标未及时回到原选区，本次未发送滚动；请核对后手动滚动。") }
+                let point = try readPointer()
+                diagnostic.pointerWaitMilliseconds = Int((ProcessInfo.processInfo.systemUptime - began) * 1_000)
+                diagnostic.pointerInsideROI = roi.contains(point) ? 1 : 0
+                if diagnostic.pointerInsideROI == 1 { return point }
+                if !announced { waitingForPointer(); announced = true }
+                // Only pointer/cancellation/clock polling; no AX scan, activation or input while waiting.
+                try await Task.sleep(nanoseconds: 25_000_000)
+            }
+        }
+        func checkPointerHit(_ expected: CGPoint) throws {
+            let point = try readPointer()
+            diagnostic.pointerStayed = point == expected ? 1 : 0
+            diagnostic.pointerInsideROI = roi.contains(point) ? 1 : 0
+            guard diagnostic.pointerStayed == 1, diagnostic.pointerInsideROI == 1 else { throw unavailable }
+            diagnostic.substep = .mouseButtons
+            // Includes physical devices and synthesized button state; any held button refuses the wheel.
+            diagnostic.pointerButtonsReleased = NSEvent.pressedMouseButtons == 0 ? 1 : 0
+            guard diagnostic.pointerButtonsReleased == 1 else { throw unavailable }
+            diagnostic.substep = .pointerHit
+            let cocoa = try ScrollInputPolicy.cocoaPoint(fromQuartz: point, primaryDisplayBounds: CGDisplayBounds(CGMainDisplayID()))
+            // Public WindowServer hit-test returns the actual frontmost mouse target, not a bounds guess.
+            let windowNumber = NSWindow.windowNumber(at: cocoa, belowWindowWithWindowNumber: 0)
+            diagnostic.pointerWindowMatches = windowNumber > 0 && UInt64(windowNumber) == UInt64(target.windowID) ? 1 : 0
+            guard diagnostic.pointerWindowMatches == 1 else { throw unavailable }
+        }
 
         diagnostic.stage = .beforeInput
         let readiness = try checkedInputReadiness()
@@ -607,53 +659,44 @@ enum ScrollAccessibilityAction {
                                                inputAlreadyAttempted: attempt.state != .unused,
                                                postingAvailable: readiness.postingAvailable)
         } catch { throw unavailable }
-        // Construct both events before the first input; a failed constructor never primes the target.
-        let pixelEvents: ScrollPixelEventBundle?
-        if decision.strategy == .pixel {
-            guard let events = ScrollPixelEventBundle(windowID: target.windowID, anchor: anchor, pixels: decision.pixels) else { throw unavailable }
-            pixelEvents = events
-        } else { pixelEvents = nil }
-        try finalSourceGuard()
-        diagnostic.stage = .performAction
-        do {
-            try attempt.begin(decision: decision, freshCapability: readiness.capability,
-                              postingAvailable: readiness.postingAvailable)
-        } catch { throw unavailable }
         switch decision.strategy {
         case .native:
+            try finalSourceGuard()
+            do {
+                try attempt.begin(decision: decision, freshCapability: readiness.capability,
+                                  postingAvailable: readiness.postingAvailable)
+            } catch { throw unavailable }
+            diagnostic.stage = .performAction
             diagnostic.actionAttempted = true
             let result = diagnostic.observed(AXUIElementPerformAction(choice.node.element, action), .performAction)
             guard result == .success else {
                 throw CaptureFailure.unsupported("滚入视口动作结果未确认（AX \(result.rawValue)），未重复发送；请检查原窗口后手动滚动。")
             }
             diagnostic.actionSucceeded = true
-        case .pixel:
-            guard let pixelEvents else { throw unavailable }
-            diagnostic.stage = .priming
-            diagnostic.substep = .primePost
-            pixelEvents.prime.postToPid(target.processID)
-            diagnostic.primePosted = true
+        case .windowServer:
+            let point = try await pointerInRegion()
+            try checkDeadlineAndFocus()
+            diagnostic.stage = .beforeWheel
+            try checkPointerHit(point)
+            // The actual pointer must hit the same bound AX area, PID and window, not merely the ROI rectangle.
+            let wheelReadiness = try checkedInputReadiness(hitPoint: point)
             do {
-                diagnostic.substep = .primeWait
-                try await Task.sleep(nanoseconds: 20_000_000)
-                // The wait consumes the original phase/transaction budget; it never renews either.
-                try checkDeadlineAndFocus()
-                diagnostic.stage = .beforeWheel
-                let wheelReadiness = try checkedInputReadiness()
-                try finalSourceGuard()
-                try attempt.beginWheel(decision: decision, freshCapability: wheelReadiness.capability,
-                                       postingAvailable: wheelReadiness.postingAvailable)
-            } catch is CancellationError {
-                attempt.refuse()
-                throw CancellationError()
-            } catch {
-                attempt.refuse()
-                throw CaptureFailure.unsupported("滚动前原窗口状态未通过再次核验，已停止且未追加截图；请核对原窗口后手动滚动。")
-            }
+                try ScrollInputPolicy.requireReady(decision, freshCapability: wheelReadiness.capability,
+                                                   inputAlreadyAttempted: attempt.state != .unused,
+                                                   postingAvailable: wheelReadiness.postingAvailable)
+            } catch { throw unavailable }
+            guard let event = ScrollPixelEventBundle(anchor: point, pixels: decision.pixels) else { throw unavailable }
+            try finalSourceGuard()
+            try checkPointerHit(point)
+            try checkDeadlineAndFocus()
+            do {
+                try attempt.begin(decision: decision, freshCapability: wheelReadiness.capability,
+                                  postingAvailable: wheelReadiness.postingAvailable)
+            } catch { throw unavailable }
             diagnostic.stage = .performAction
             diagnostic.substep = .wheelPost
-            pixelEvents.wheel.postToPid(target.processID)
-            // These void posts acknowledge neither delivery nor source movement. There is only one wheel.
+            event.wheel.post(tap: .cghidEventTap)
+            // One public event-stream post, no prime or cursor relocation. Return is not delivery evidence.
             diagnostic.wheelPosted = true
         }
         diagnostic.stage = .settling

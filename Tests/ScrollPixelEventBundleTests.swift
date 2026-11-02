@@ -25,23 +25,12 @@ private func expect(_ value: @autoclosure () -> Bool, _ message: String) throws 
 
     private static func run() throws {
         var passed: [String] = []
-        try expect(CGEventField.mouseEventWindowUnderMousePointer.rawValue == 91,
-                   "Expected public window-under-pointer field 91")
-        try expect(CGEventField.mouseEventWindowUnderMousePointerThatCanHandleThisEvent.rawValue == 92,
-                   "Expected public event-handling-window field 92")
-        passed.append("typedPublicWindowFields")
-
         let anchor = CGPoint(x: 651, y: 663.5)
-        // Earlier raw failure and refusal fixtures remain archived unchanged. The accepted contract
-        // binds only the prime to the original window; the wheel's PID/session binding belongs to its caller.
-        guard let bundle = ScrollPixelEventBundle(windowID: 101, anchor: anchor, pixels: 1) else {
-            throw FixtureFailure(message: "Expected window-bound prime and bounded wheel construction")
+        // Earlier prime/PID fixtures remain archived unchanged. This fixture constructs a single wheel;
+        // it never posts to WindowServer and cannot validate source/pointer guards or delivery.
+        guard let bundle = ScrollPixelEventBundle(anchor: anchor, pixels: 1) else {
+            throw FixtureFailure(message: "Expected single bounded wheel construction")
         }
-        try expect(bundle.prime.type == .mouseMoved && bundle.prime.location == anchor && bundle.prime.flags.isEmpty,
-                   "Prime type, original anchor or empty flags changed")
-        try expect(bundle.prime.getIntegerValueField(.mouseEventWindowUnderMousePointer) == 101 &&
-                   bundle.prime.getIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent) == 101,
-                   "Prime did not retain both public original-window fields")
         try expect(bundle.wheel.type == .scrollWheel && bundle.wheel.location == anchor && bundle.wheel.flags.isEmpty,
                    "Wheel type, original anchor or empty flags changed")
         try expect(bundle.wheel.getIntegerValueField(.scrollWheelEventIsContinuous) != 0 &&
@@ -49,12 +38,9 @@ private func expect(_ value: @autoclosure () -> Bool, _ message: String) throws 
                    bundle.wheel.getIntegerValueField(.scrollWheelEventPointDeltaAxis2) == 0 &&
                    bundle.wheel.getIntegerValueField(.scrollWheelEventPointDeltaAxis3) == 0,
                    "Wheel must retain one negative vertical pixel with no other axes")
-        passed.append("windowBoundPrimeAndBoundedWheelConstructed")
-        try expect(ScrollPixelEventBundle(windowID: 0, anchor: anchor, pixels: 100) == nil,
-                   "Null original window must be refused")
-        passed.append("nullWindowRefused")
+        passed.append("singleBoundedWheelConstructed")
         for pixels in [Int32(0), -1, 241, .max, .min] {
-            try expect(ScrollPixelEventBundle(windowID: 101, anchor: anchor, pixels: pixels) == nil,
+            try expect(ScrollPixelEventBundle(anchor: anchor, pixels: pixels) == nil,
                        "Out-of-budget pixel amount accepted: \(pixels)")
             passed.append("invalidPixels_\(pixels)")
         }
@@ -67,17 +53,17 @@ private func expect(_ value: @autoclosure () -> Bool, _ message: String) throws 
             ("negativeInfiniteY", CGPoint(x: 1, y: -CGFloat.infinity))
         ]
         for (name, point) in invalid {
-            try expect(ScrollPixelEventBundle(windowID: 101, anchor: point, pixels: 100) == nil,
+            try expect(ScrollPixelEventBundle(anchor: point, pixels: 100) == nil,
                        "Nonfinite anchor accepted: \(name)")
             passed.append(name)
         }
         let result: [String: Any] = [
-            "result": "MEMORY_PRIME_WINDOW_BOUND_PID_WHEEL_CONSTRUCTION_ONLY",
+            "result": "MEMORY_SINGLE_PIXEL_WHEEL_CONSTRUCTION_ONLY",
             "constructionChecks": "PASS", "deliveryProven": false, "wheelCarriesWindowIDClaim": false,
             "caseCount": passed.count, "cases": passed,
             "eventsPosted": 0, "globalPointerReadsOrWarps": 0, "appOrWindowQueries": 0,
             "earlierRawFailure": "Acceptance-2026-10-28/WindowPrimeConstructionBlocker.noindex/first-failed-raw-output.json",
-            "scope": "Memory construction only: prime carries original window metadata; wheel has only bounded pixel data and anchor. Caller must retain original PID/session guards. No delivery or live scrolling claim"
+            "scope": "Single wheel memory construction and parameter rejection only. No window metadata, prime, post, pointer read, WindowServer delivery or live scrolling claim. Caller must retain source/pointer guards"
         ]
         let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
         FileHandle.standardOutput.write(data); FileHandle.standardOutput.write(Data("\n".utf8))

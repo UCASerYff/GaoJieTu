@@ -101,7 +101,10 @@ final class LongCapturePanelController: NSObject, NSWindowDelegate {
             guard let self else { return }
             do {
                 let seam: ScrollSeamEstimate?
-                if scroll { seam = try await session.scrollAndCapture(using: service, source: source, options: self.options) }
+                if scroll {
+                    seam = try await session.scrollAndCapture(using: service, source: source, options: self.options,
+                        waitingForPointer: { [weak self] in self?.status.stringValue = "请将鼠标移回原选区，最多等待2秒；不会自动移动鼠标。" })
+                }
                 else { seam = try await session.captureNext(using: service, source: source, options: self.options) }
                 guard !Task.isCancelled, operation.isActive, self.operation === operation else { return }
                 if let pending = session.pendingSeam { self.showSeam(pending) }

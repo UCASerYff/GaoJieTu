@@ -15,6 +15,14 @@ private func rejectMotion(_ expected: ScrollVisibilityPlan.Failure, _ body: () t
     do { try body(); throw FixtureFailure(message: "Expected movement rejection: \(expected)") }
     catch let error as ScrollVisibilityPlan.Failure { try expect(error == expected, "Wrong movement rejection") }
 }
+private func rejectWait(_ expected: ScrollInputPolicy.PointerWaitDeadline.Failure, _ body: () throws -> Void) throws {
+    do { try body(); throw FixtureFailure(message: "Expected pointer wait rejection: \(expected)") }
+    catch let error as ScrollInputPolicy.PointerWaitDeadline.Failure { try expect(error == expected, "Wrong pointer wait rejection") }
+}
+private func rejectGeometry(_ expected: ScrollInputPolicy.PointerGeometryFailure, _ body: () throws -> Void) throws {
+    do { try body(); throw FixtureFailure(message: "Expected pointer geometry rejection: \(expected)") }
+    catch let error as ScrollInputPolicy.PointerGeometryFailure { try expect(error == expected, "Wrong pointer geometry rejection") }
+}
 private func plan(minimum: CGFloat = 50, roiHeight: CGFloat = 960, requested: CGFloat = 240) throws -> ScrollVisibilityPlan {
     try ScrollVisibilityPlan.makePlan(viewport: CGRect(x: 0, y: 0, width: 1000, height: 1000),
         roi: CGRect(x: 20, y: 20, width: 960, height: roiHeight),
@@ -27,7 +35,7 @@ private func plan(minimum: CGFloat = 50, roiHeight: CGFloat = 960, requested: CG
         let small = try plan(minimum: 50), large = try plan(minimum: 150)
         let mixed = try ScrollInputPolicy.select([.init(plan: small, capability: .absent), .init(plan: large, capability: .advertised)], requestedPoints: 240)
         try expect(mixed.index == 1 && mixed.strategy == .native && mixed.pixels == 0, "Native must win over cheaper absent candidate")
-        passed.append("nativePreferredOverCheaperPixel")
+        passed.append("nativePreferredOverCheaperWindowServer")
         let native = try ScrollInputPolicy.select([.init(plan: large, capability: .advertised), .init(plan: small, capability: .advertised)], requestedPoints: 240)
         try expect(native.index == 1 && native.strategy == .native, "Choose smallest valid native target")
         passed.append("smallestNativeCandidate")
@@ -44,9 +52,9 @@ private func plan(minimum: CGFloat = 50, roiHeight: CGFloat = 960, requested: CG
         try rejectPolicy(.unknownCapability) { _ = try ScrollInputPolicy.select([.init(plan: small, capability: .unknown)], requestedPoints: 240) }
         passed.append("unknownNeverMeansAbsent")
         try rejectPolicy(.unknownCapability) { _ = try ScrollInputPolicy.select([.init(plan: small, capability: .absent), .init(plan: large, capability: .unknown)], requestedPoints: 240) }
-        passed.append("partlyUnknownCannotAuthorizePixel")
+        passed.append("partlyUnknownCannotAuthorizeWindowServer")
         let fractional = try ScrollInputPolicy.select([.init(plan: small, capability: .absent)], requestedPoints: 60.9)
-        try expect(fractional.pixels == 60 && fractional.strategy == .pixel, "Respect smaller request and floor")
+        try expect(fractional.pixels == 60 && fractional.strategy == .windowServer, "Respect smaller request and floor")
         passed.append("smallerRequestAndFloor")
         let tiny = try plan(minimum: 0.2, requested: 0.9)
         try rejectPolicy(.invalidPixelBudget) { _ = try ScrollInputPolicy.select([.init(plan: tiny, capability: .absent)], requestedPoints: 0.9) }
@@ -58,25 +66,25 @@ private func plan(minimum: CGFloat = 50, roiHeight: CGFloat = 960, requested: CG
         let bounded = try ScrollInputPolicy.select([.init(plan: lowROI, capability: .absent)], requestedPoints: 240)
         try expect(bounded.pixels == 100, "ROI half-height floor must apply")
         passed.append("halfROIFloor")
-        let pixel = try ScrollInputPolicy.select([.init(plan: small, capability: .absent)], requestedPoints: 500)
-        try expect(pixel.pixels == 240, "The single wheel keeps the existing pixel ceiling")
+        let wheel = try ScrollInputPolicy.select([.init(plan: small, capability: .absent)], requestedPoints: 500)
+        try expect(wheel.pixels == 240, "The single wheel keeps the existing wheel ceiling")
         passed.append("singleWheelPixelCeiling")
         try rejectPolicy(.invalidPixelBudget) { _ = try ScrollInputPolicy.select([.init(plan: small, capability: .absent)], requestedPoints: .nan) }
         passed.append("nonfiniteRequestRefused")
-        try rejectPolicy(.capabilityChanged) { try ScrollInputPolicy.requireReady(pixel, freshCapability: .advertised, inputAlreadyAttempted: false, postingAvailable: true) }
+        try rejectPolicy(.capabilityChanged) { try ScrollInputPolicy.requireReady(wheel, freshCapability: .advertised, inputAlreadyAttempted: false, postingAvailable: true) }
         passed.append("newNativeCapabilityDoesNotSwitchMidFlight")
-        try rejectPolicy(.capabilityChanged) { try ScrollInputPolicy.requireReady(pixel, freshCapability: .unknown, inputAlreadyAttempted: false, postingAvailable: true) }
-        passed.append("selectedPixelMustRemainKnownAbsent")
+        try rejectPolicy(.capabilityChanged) { try ScrollInputPolicy.requireReady(wheel, freshCapability: .unknown, inputAlreadyAttempted: false, postingAvailable: true) }
+        passed.append("selectedWindowServerMustRemainKnownAbsent")
         try rejectPolicy(.capabilityChanged) { try ScrollInputPolicy.requireReady(native, freshCapability: .absent, inputAlreadyAttempted: false, postingAvailable: true) }
         passed.append("lostNativeDoesNotFallBack")
-        try rejectPolicy(.postingUnavailable) { try ScrollInputPolicy.requireReady(pixel, freshCapability: .absent, inputAlreadyAttempted: false, postingAvailable: false) }
+        try rejectPolicy(.postingUnavailable) { try ScrollInputPolicy.requireReady(wheel, freshCapability: .absent, inputAlreadyAttempted: false, postingAvailable: false) }
         passed.append("missingPostingGrantRefused")
-        try rejectPolicy(.inputAlreadyAttempted) { try ScrollInputPolicy.requireReady(pixel, freshCapability: .absent, inputAlreadyAttempted: true, postingAvailable: true) }
-        passed.append("priorAXOrCGAttemptPreventsPixel")
+        try rejectPolicy(.inputAlreadyAttempted) { try ScrollInputPolicy.requireReady(wheel, freshCapability: .absent, inputAlreadyAttempted: true, postingAvailable: true) }
+        passed.append("priorAttemptPreventsWindowServer")
         try rejectPolicy(.inputAlreadyAttempted) { try ScrollInputPolicy.requireReady(native, freshCapability: .advertised, inputAlreadyAttempted: true, postingAvailable: true) }
         passed.append("priorAttemptPreventsNativeRetry")
-        try ScrollInputPolicy.requireReady(pixel, freshCapability: .absent, inputAlreadyAttempted: false, postingAvailable: true)
-        passed.append("freshExplicitAbsenceAllowsOnePixelRoute")
+        try ScrollInputPolicy.requireReady(wheel, freshCapability: .absent, inputAlreadyAttempted: false, postingAvailable: true)
+        passed.append("freshExplicitAbsenceAllowsOneWindowServerWheel")
         let p = small
         func shifted(_ rect: CGRect, _ delta: CGFloat) -> CGRect { rect.offsetBy(dx: 0, dy: -delta) }
         try expect(try p.verify(viewportAfter: p.viewport, roiAfter: p.roi, markerAfter: shifted(p.marker, 100), targetAfter: shifted(p.target, 100)) == 100, "Consistent verified motion")
@@ -96,128 +104,102 @@ private func plan(minimum: CGFloat = 50, roiHeight: CGFloat = 960, requested: CG
         try rejectMotion(.regionChanged) { _ = try p.verify(viewportAfter: p.viewport, roiAfter: p.roi.offsetBy(dx: 1, dy: 0), markerAfter: shifted(p.marker, 100), targetAfter: shifted(p.target, 100)) }
         passed.append("originalROIRequired")
 
+        try expect(ScrollInputPolicy.Strategy.windowServer.rawValue == 3
+                   && ScrollInputPolicy.Strategy(rawValue: 2) == nil, "The old PID wheel route must not remain selectable")
+        passed.append("onlyNativeOrWindowServerRoutes")
         var successful = ScrollInputPolicy.Attempt()
-        var simulatedPrimeCount = 0, simulatedWheelCount = 0
-        try expect(successful.state == .unused, "A logical attempt starts unused")
-        try successful.begin(decision: pixel, freshCapability: .absent, postingAvailable: true)
-        simulatedPrimeCount += 1
-        try expect(successful.state == .ownPrimed, "Begin must consume the attempt before posting a prime")
-        try successful.beginWheel(decision: pixel, freshCapability: .absent, postingAvailable: true)
-        simulatedWheelCount += 1
-        try expect(successful.state == .wheelAttempted && simulatedPrimeCount == 1 && simulatedWheelCount == 1,
-                   "Success allows one prime and one wheel in a single logical transaction")
-        passed.append("singleLogicalPrimeThenWheel")
+        var simulatedPosts = 0
+        try successful.begin(decision: wheel, freshCapability: .absent, postingAvailable: true)
+        simulatedPosts += 1
+        try expect(successful.state == .wheelAttempted && simulatedPosts == 1, "One wheel immediately consumes the attempt")
+        passed.append("singleWheelIsTerminalAttempt")
         try rejectPolicy(.inputAlreadyAttempted) {
-            try successful.beginWheel(decision: pixel, freshCapability: .absent, postingAvailable: true)
-            simulatedWheelCount += 1
+            try successful.begin(decision: wheel, freshCapability: .absent, postingAvailable: true)
+            simulatedPosts += 1
         }
-        try expect(successful.state == .refused && simulatedWheelCount == 1, "A second wheel permanently refuses the transaction")
+        try expect(successful.state == .refused && simulatedPosts == 1, "A second wheel must not be posted")
         passed.append("secondWheelNeverPosted")
-        try rejectPolicy(.inputAlreadyAttempted) {
-            try successful.begin(decision: pixel, freshCapability: .absent, postingAvailable: true)
-            simulatedPrimeCount += 1
-        }
-        try expect(simulatedPrimeCount == 1 && successful.state == .refused, "A consumed attempt cannot be reset")
-        passed.append("refusedTransactionCannotRestart")
-
-        var wheelBeforePrime = ScrollInputPolicy.Attempt()
-        try rejectPolicy(.inputAlreadyAttempted) {
-            try wheelBeforePrime.beginWheel(decision: pixel, freshCapability: .absent, postingAvailable: true)
-        }
-        try expect(wheelBeforePrime.state == .refused, "A wheel without a prime must refuse")
-        passed.append("wheelRequiresOwnPrime")
-
-        var duplicatePrime = ScrollInputPolicy.Attempt()
-        try duplicatePrime.begin(decision: pixel, freshCapability: .absent, postingAvailable: true)
-        try rejectPolicy(.inputAlreadyAttempted) {
-            try duplicatePrime.begin(decision: pixel, freshCapability: .absent, postingAvailable: true)
-        }
-        try expect(duplicatePrime.state == .refused, "A second prime is forbidden")
-        passed.append("primeCannotRepeat")
 
         var nativeAttempt = ScrollInputPolicy.Attempt()
         try nativeAttempt.begin(decision: native, freshCapability: .advertised, postingAvailable: false)
-        try expect(nativeAttempt.state == .nativeAttempted, "Native input needs no CG posting grant")
+        try expect(nativeAttempt.state == .nativeAttempted, "A native action consumes the attempt without a CG posting grant")
         passed.append("nativeConsumesAttemptWithoutPostingGrant")
+        var fallbackPosts = 0
         try rejectPolicy(.inputAlreadyAttempted) {
-            try nativeAttempt.begin(decision: pixel, freshCapability: .absent, postingAvailable: true)
+            try nativeAttempt.begin(decision: wheel, freshCapability: .absent, postingAvailable: true)
+            fallbackPosts += 1
         }
-        try expect(nativeAttempt.state == .refused, "A native attempt cannot fall back to a prime")
-        passed.append("nativeAttemptPreventsPixelPrime")
-        try rejectPolicy(.inputAlreadyAttempted) {
-            try nativeAttempt.beginWheel(decision: pixel, freshCapability: .absent, postingAvailable: true)
-        }
-        passed.append("nativeAttemptPreventsPixelWheel")
+        try expect(nativeAttempt.state == .refused && fallbackPosts == 0, "A native attempt forbids WindowServer fallback")
+        passed.append("nativeAttemptPreventsWindowServerFallback")
 
         for (name, capability, grant, expected) in [
-            ("initialUnknownAllowsZeroEvents", ScrollInputPolicy.Capability.unknown, true, ScrollInputPolicy.Failure.capabilityChanged),
-            ("initialMissingGrantAllowsZeroEvents", .absent, false, .postingUnavailable),
-            ("initialChangedCapabilityAllowsZeroEvents", .advertised, true, .capabilityChanged)
+            ("unknownAllowsZeroPosts", ScrollInputPolicy.Capability.unknown, true, ScrollInputPolicy.Failure.capabilityChanged),
+            ("missingGrantAllowsZeroPosts", .absent, false, .postingUnavailable)
         ] {
             var attempt = ScrollInputPolicy.Attempt()
-            var primeCount = 0, wheelCount = 0
+            var posts = 0
             try rejectPolicy(expected) {
-                try attempt.begin(decision: pixel, freshCapability: capability, postingAvailable: grant)
-                primeCount += 1
+                try attempt.begin(decision: wheel, freshCapability: capability, postingAvailable: grant)
+                posts += 1
             }
             try rejectPolicy(.inputAlreadyAttempted) {
-                try attempt.beginWheel(decision: pixel, freshCapability: .absent, postingAvailable: true)
-                wheelCount += 1
+                try attempt.begin(decision: wheel, freshCapability: .absent, postingAvailable: true)
+                posts += 1
             }
-            try expect(attempt.state == .refused && primeCount == 0 && wheelCount == 0, "Initial refusal must allow no simulated events")
+            try expect(attempt.state == .refused && posts == 0, "Refusal is permanent even if conditions later change")
             passed.append(name)
         }
-
-        for (name, capability, grant, expected) in [
-            ("unknownAfterPrimeAllowsZeroWheels", ScrollInputPolicy.Capability.unknown, true, ScrollInputPolicy.Failure.capabilityChanged),
-            ("nativeCapabilityAfterPrimeDoesNotSwitch", .advertised, true, .capabilityChanged),
-            ("postingGrantLostAfterPrimeAllowsZeroWheels", .absent, false, .postingUnavailable)
-        ] {
-            var attempt = ScrollInputPolicy.Attempt()
-            var wheelCount = 0
-            try attempt.begin(decision: pixel, freshCapability: .absent, postingAvailable: true)
-            try rejectPolicy(expected) {
-                try attempt.beginWheel(decision: pixel, freshCapability: capability, postingAvailable: grant)
-                wheelCount += 1
-            }
-            try expect(attempt.state == .refused && wheelCount == 0, "Revalidation refusal consumes prime without a wheel")
-            try rejectPolicy(.inputAlreadyAttempted) {
-                try attempt.beginWheel(decision: pixel, freshCapability: .absent, postingAvailable: true)
-                wheelCount += 1
-            }
-            try expect(wheelCount == 0, "Restoring capability or permission cannot retry the refused transaction")
-            passed.append(name)
+        var guardRefused = ScrollInputPolicy.Attempt()
+        var guardRefusedPosts = 0
+        guardRefused.refuse()
+        try rejectPolicy(.inputAlreadyAttempted) {
+            try guardRefused.begin(decision: wheel, freshCapability: .absent, postingAvailable: true)
+            guardRefusedPosts += 1
         }
+        try expect(guardRefused.state == .refused && guardRefusedPosts == 0, "A failed source, cancellation or time guard permits no post")
+        passed.append("guardRefusalAllowsZeroPosts")
 
-        for (name, changedDecision) in [
-            ("primedCandidateCannotChange", ScrollInputPolicy.Decision(index: pixel.index + 1, strategy: .pixel, pixels: pixel.pixels)),
-            ("primedPixelBudgetCannotChange", .init(index: pixel.index, strategy: .pixel, pixels: pixel.pixels - 1)),
-            ("primedStrategyCannotChange", .init(index: pixel.index, strategy: .native, pixels: 0))
-        ] {
-            var attempt = ScrollInputPolicy.Attempt()
-            try attempt.begin(decision: pixel, freshCapability: .absent, postingAvailable: true)
-            try rejectPolicy(.capabilityChanged) {
-                try attempt.beginWheel(decision: changedDecision, freshCapability: .absent, postingAvailable: true)
-            }
-            try expect(attempt.state == .refused, "Original decision remains frozen across the prime")
-            passed.append(name)
-        }
+        typealias Wait = ScrollInputPolicy.PointerWaitDeadline
+        let fixed = try Wait.fixedDeadline(now: 10, phaseDeadline: 20, transactionDeadline: 30)
+        try expect(fixed == 12, "Pointer waiting allows at most two seconds")
+        try expect(try Wait.fixedDeadline(now: 10, phaseDeadline: 11, transactionDeadline: 30) == 11, "The original phase deadline wins")
+        try expect(try Wait.fixedDeadline(now: 10, phaseDeadline: 20, transactionDeadline: 10.5) == 10.5, "The original transaction deadline wins")
+        passed.append("pointerWaitUsesEarliestOriginalDeadline")
+        try Wait.requireActive(now: 11.9, deadline: fixed)
+        try rejectWait(.expired) { try Wait.requireActive(now: 12, deadline: fixed) }
+        try rejectWait(.expired) { try Wait.requireActive(now: 12.1, deadline: fixed) }
+        try expect(fixed == 12, "Checking the wait must never renew its deadline")
+        passed.append("pointerWaitDeadlineDoesNotRenew")
+        try rejectWait(.expired) { _ = try Wait.fixedDeadline(now: 10, phaseDeadline: 10, transactionDeadline: 30) }
+        try rejectWait(.invalidClock) { _ = try Wait.fixedDeadline(now: .nan, phaseDeadline: 20, transactionDeadline: 30) }
+        try rejectWait(.invalidClock) { try Wait.requireActive(now: 10, deadline: .infinity) }
+        passed.append("invalidOrExpiredPointerWaitRefused")
 
-        // These fixtures model the live adapter refusing after its existing source guards fail.
-        // They exercise attempt consumption only; they make no claim about real AX metadata.
-        for reason in ["regionChanged", "sourceIdentityChanged", "cancelled", "deadlineExpired", "parentChanged", "markerChanged", "targetChanged"] {
-            var attempt = ScrollInputPolicy.Attempt()
-            var wheelCount = 0
-            try attempt.begin(decision: pixel, freshCapability: .absent, postingAvailable: true)
-            attempt.refuse()
-            try rejectPolicy(.inputAlreadyAttempted) {
-                try attempt.beginWheel(decision: pixel, freshCapability: .absent, postingAvailable: true)
-                wheelCount += 1
-            }
-            try expect(attempt.state == .refused && wheelCount == 0, "Failed source guard cannot lead to a wheel")
-            passed.append("\(reason)AfterPrimeAllowsZeroWheels")
+        let primary = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        try expect(try ScrollInputPolicy.cocoaPoint(fromQuartz: CGPoint(x: 40, y: 30), primaryDisplayBounds: primary)
+                   == CGPoint(x: 40, y: 1050), "Quartz-to-Cocoa must flip Y using the primary height")
+        passed.append("quartzToCocoaUsesPrimaryHeight")
+        try expect(try ScrollInputPolicy.cocoaPoint(fromQuartz: CGPoint(x: -500, y: 1200), primaryDisplayBounds: primary)
+                   == CGPoint(x: -500, y: -120), "Other-display global points below or left of primary remain valid")
+        try expect(try ScrollInputPolicy.cocoaPoint(fromQuartz: CGPoint(x: 2500, y: -200), primaryDisplayBounds: primary)
+                   == CGPoint(x: 2500, y: 1280), "Other-display global points above or right of primary remain valid")
+        passed.append("otherDisplayGlobalCoordinatesAllowed")
+        try rejectGeometry(.invalidPrimaryDisplay) {
+            _ = try ScrollInputPolicy.cocoaPoint(fromQuartz: .zero, primaryDisplayBounds: primary.offsetBy(dx: 1, dy: 0))
         }
-        let result: [String: Any] = ["result": "PURE_POLICY_ATTEMPT_AND_MOVEMENT_FIXTURE_PASS", "caseCount": passed.count, "cases": passed, "realInputsOrAXOrCapture": false, "scope": "Pure input decision, logical-attempt accounting and unchanged geometry verification; simulated event counters only, no live delivery or full capture pipeline claim"]
+        try rejectGeometry(.invalidPrimaryDisplay) {
+            _ = try ScrollInputPolicy.cocoaPoint(fromQuartz: .zero, primaryDisplayBounds: CGRect(x: 0, y: 0, width: 1920, height: 0))
+        }
+        passed.append("invalidPrimaryDisplayGeometryRefused")
+        try rejectGeometry(.invalidPoint) {
+            _ = try ScrollInputPolicy.cocoaPoint(fromQuartz: CGPoint(x: CGFloat.nan, y: 0), primaryDisplayBounds: primary)
+        }
+        try rejectGeometry(.invalidPoint) {
+            _ = try ScrollInputPolicy.cocoaPoint(fromQuartz: CGPoint(x: 0, y: -CGFloat.greatestFiniteMagnitude),
+                primaryDisplayBounds: CGRect(x: 0, y: 0, width: 1, height: CGFloat.greatestFiniteMagnitude))
+        }
+        passed.append("invalidOrOverflowingPointerPointRefused")
+        let result: [String: Any] = ["result": "PURE_WINDOWSERVER_POLICY_WAIT_AND_MOVEMENT_FIXTURE_PASS", "caseCount": passed.count, "cases": passed, "realInputsOrAXOrCapture": false, "scope": "Pure route decision, one-attempt accounting, fixed pointer-wait deadline, coordinate arithmetic and unchanged movement verification; simulated post counters only, no live pointer/window/event or capture claim"]
         let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
         FileHandle.standardOutput.write(data); FileHandle.standardOutput.write(Data("\n".utf8))
     }

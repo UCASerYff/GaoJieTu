@@ -162,12 +162,13 @@ final class LongScreenshotSession {
 
     /// A single explicit scroll action, never a hidden global loop. A changed target immediately pauses.
     @discardableResult
-    func scrollAndCapture(using service: CaptureService, source: CaptureSource, downwardPoints: Int32 = 240, options: CaptureOptions = .init()) async throws -> ScrollSeamEstimate? {
+    func scrollAndCapture(using service: CaptureService, source: CaptureSource, downwardPoints: Int32 = 240,
+                          options: CaptureOptions = .init(), waitingForPointer: () -> Void = {}) async throws -> ScrollSeamEstimate? {
         guard let target else { throw CaptureFailure.unsupported("自动滚动需要明确的目标窗口；无目标时请手动滚动。") }
         guard AXIsProcessTrusted() else { throw CaptureFailure.unsupported("辅助功能权限未授权，仍可使用手动滚动逐帧拼接。") }
         return try await scrollAndCapture(downwardPoints: downwardPoints, performScroll: { anchor in
             guard let windowIdentity = self.targetGuard?.boundAccessibilityIdentity else { throw CaptureFailure.sourceMissing }
-            try await ScrollAccessibilityAction.scrollDown(target: target, anchor: anchor, requestedPoints: CGFloat(downwardPoints), windowIdentity: windowIdentity, cursor: self.accessibilityScrollCursor) {
+            try await ScrollAccessibilityAction.scrollDown(target: target, anchor: anchor, requestedPoints: CGFloat(downwardPoints), windowIdentity: windowIdentity, cursor: self.accessibilityScrollCursor, waitingForPointer: waitingForPointer) {
                 _ = try self.validateCurrentTarget(stage: .preScroll)
             }
         }, capturing: { try await service.capture(source, options: options).image })

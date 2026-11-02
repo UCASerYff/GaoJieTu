@@ -4,7 +4,7 @@ import CoreGraphics
 /// Pure input selection and attempt accounting. No AX, event creation, permission request or input occurs here.
 struct ScrollInputPolicy {
     enum Capability: Equatable { case advertised, absent, unknown }
-    enum Strategy: Int { case native = 1, pixel = 2 }
+    enum Strategy: Int { case native = 1, windowServer = 3 }
     enum Failure: Error, Equatable { case noCandidate, unknownCapability, invalidPixelBudget, capabilityChanged, inputAlreadyAttempted, postingUnavailable }
     struct Candidate {
         let plan: ScrollVisibilityPlan
@@ -16,38 +16,22 @@ struct ScrollInputPolicy {
         let pixels: Int32
     }
 
-    /// One logical transaction. A prepared hover can lead to one wheel, never a new input strategy.
+    /// One input attempt. A native action and a WindowServer wheel can never share a transaction.
     struct Attempt {
         enum State: Int {
-            case unused = 0, nativeAttempted, ownPrimed, wheelAttempted, refused
+            case unused = 0, nativeAttempted = 1, wheelAttempted = 3, refused = 4
         }
         private(set) var state = State.unused
-        private var originalDecision: Decision?
 
         init() {}
 
-        /// Advance immediately before the native action or PID-bound preparatory event is posted.
+        /// Advance immediately before the sole native action or WindowServer wheel is posted.
         mutating func begin(decision: Decision, freshCapability: Capability, postingAvailable: Bool) throws {
             do {
                 guard state == .unused else { throw Failure.inputAlreadyAttempted }
                 try ScrollInputPolicy.requireReady(decision, freshCapability: freshCapability,
                     inputAlreadyAttempted: state != .unused, postingAvailable: postingAvailable)
-                originalDecision = decision
-                state = decision.strategy == .native ? .nativeAttempted : .ownPrimed
-            } catch {
-                refuse()
-                throw error
-            }
-        }
-
-        /// Called only after all original-source guards have been checked again following the prime.
-        mutating func beginWheel(decision: Decision, freshCapability: Capability, postingAvailable: Bool) throws {
-            do {
-                guard state == .ownPrimed else { throw Failure.inputAlreadyAttempted }
-                guard originalDecision == decision, decision.strategy == .pixel,
-                      freshCapability == .absent else { throw Failure.capabilityChanged }
-                guard decision.pixels >= 1, postingAvailable else { throw Failure.postingUnavailable }
-                state = .wheelAttempted
+                state = decision.strategy == .native ? .nativeAttempted : .wheelAttempted
             } catch {
                 refuse()
                 throw error
@@ -56,6 +40,39 @@ struct ScrollInputPolicy {
 
         /// A failed guard, cancellation or expired deadline permanently consumes this transaction.
         mutating func refuse() { state = .refused }
+    }
+
+    /// Pure arithmetic only. The caller creates one deadline, then only checks that fixed value.
+    enum PointerWaitDeadline {
+        enum Failure: Error, Equatable { case invalidClock, expired }
+
+        static func fixedDeadline(now: TimeInterval, phaseDeadline: TimeInterval,
+                                  transactionDeadline: TimeInterval) throws -> TimeInterval {
+            guard now.isFinite, now >= 0, phaseDeadline.isFinite, transactionDeadline.isFinite else {
+                throw Failure.invalidClock
+            }
+            let deadline = min(now + 2, phaseDeadline, transactionDeadline)
+            try requireActive(now: now, deadline: deadline)
+            return deadline
+        }
+
+        static func requireActive(now: TimeInterval, deadline: TimeInterval) throws {
+            guard now.isFinite, now >= 0, deadline.isFinite else { throw Failure.invalidClock }
+            guard now < deadline else { throw Failure.expired }
+        }
+    }
+
+    enum PointerGeometryFailure: Error, Equatable { case invalidPrimaryDisplay, invalidPoint }
+
+    /// Quartz uses the primary display's top-left; AppKit uses its bottom-left in global points.
+    /// Points outside the primary display are valid and retain their global horizontal coordinate.
+    static func cocoaPoint(fromQuartz point: CGPoint, primaryDisplayBounds bounds: CGRect) throws -> CGPoint {
+        guard bounds.origin == .zero, bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0 else { throw PointerGeometryFailure.invalidPrimaryDisplay }
+        guard point.x.isFinite, point.y.isFinite else { throw PointerGeometryFailure.invalidPoint }
+        let result = CGPoint(x: point.x, y: bounds.height - point.y)
+        guard result.y.isFinite else { throw PointerGeometryFailure.invalidPoint }
+        return result
     }
 
     static func select(_ candidates: [Candidate], requestedPoints: CGFloat) throws -> Decision {
@@ -74,7 +91,7 @@ struct ScrollInputPolicy {
         let amount = floor(min(240, requestedPoints, plan.roi.height * 0.5))
         guard requestedPoints.isFinite, requestedPoints > 0, requestedPoints <= 2_000,
               amount.isFinite, amount >= 1, amount <= plan.stepBudget, amount >= plan.expectedMinimumScroll else { throw Failure.invalidPixelBudget }
-        return Decision(index: index, strategy: .pixel, pixels: Int32(amount))
+        return Decision(index: index, strategy: .windowServer, pixels: Int32(amount))
     }
 
     static func requireReady(_ decision: Decision, freshCapability: Capability,
@@ -82,7 +99,7 @@ struct ScrollInputPolicy {
         guard !inputAlreadyAttempted else { throw Failure.inputAlreadyAttempted }
         let expected: Capability = decision.strategy == .native ? .advertised : .absent
         guard freshCapability == expected else { throw Failure.capabilityChanged }
-        if decision.strategy == .pixel {
+        if decision.strategy == .windowServer {
             guard decision.pixels >= 1, postingAvailable else { throw Failure.postingUnavailable }
         }
     }
